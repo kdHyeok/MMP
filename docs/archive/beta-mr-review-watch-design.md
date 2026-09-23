@@ -1,6 +1,6 @@
 # beta 설계: `mattermost-review-watch` (폐기됨)
 
-> **⚠️ 이 설계는 구현되지 않았습니다.** v0.3.0은 Mattermost WebSocket 대신 **GitLab todos 폴링**으로 구현됐습니다 — `bin/mr-watch.mjs` + `skills/auto-review/SKILL.md`. 현재 설계는 README의 "리뷰 요청 감시" 절을 보세요. 여기 제안된 `watch_targets` 테이블과 MCP 도구 4종도 만들지 않았고, 설정은 `~/.mmp/watch.json` 파일로 대체했습니다.
+> **⚠️ 이 설계는 구현되지 않았습니다.** v0.3.0은 Mattermost WebSocket 대신 **GitLab todos 폴링**으로 구현됐습니다 — `bin/mr-watch.mjs` + `skills/auto-review/SKILL.md`. 현재 동작은 [README](../../README.md)의 "자동으로 감시하기"와 [review-harness.md](../review-harness.md)를 보세요. 여기 제안된 `watch_targets` 테이블과 MCP 도구 4종도 만들지 않았고, 설정은 `~/.mmp/watch.json` 파일로 대체했습니다.
 >
 > 왜 그 경로를 안 갔는지의 기록으로 남깁니다. **사라진 것**: MM PAT 발급(관리자 활성화 필요), 비공개 채널 우회, WebSocket 재연결·firehose 필터, T0/T1/T2 분류, MR 번호·지라 키·요청자 교차검증. **살아남은 것**: 설정 게이트(프로젝트별 작업폴더·지라 URL 필수), 밀린 백로그 미재생, 칩 상한, 조용히 죽지 않는 오류 보고.
 

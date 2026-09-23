@@ -161,14 +161,14 @@ test("CRUD, template rendering, secret redaction, and webhook delivery", async (
       service.sendDirectMessage({
         participantId: requester.id,
         viaChannelName: "나에게 보내기",
-        text: "성용이형, MR !124 리뷰 부탁드립니다.",
+        text: "영희님, MR !124 리뷰 부탁드립니다.",
       }),
       /Review messages must use convention_name/,
     );
     assert.throws(() => service.previewMessage({
       conventionName: "review-request",
       variables: {
-        mention: "성용이형",
+        mention: "영희님",
         mr_number: 124,
         jira_key: "PROJ-124",
         message: "리뷰 부탁드립니당.",
@@ -229,7 +229,7 @@ test("CRUD, template rendering, secret redaction, and webhook delivery", async (
     );
     assert.throws(() => service.previewMessage({
       conventionName: "review-request-multi",
-      variables: { ...multiVars, mentions: "@requester.mm 성용이형" },
+      variables: { ...multiVars, mentions: "@requester.mm 영희님" },
     }), /mention must start with @/);
     assert.throws(() => service.previewMessage({
       conventionName: "review-request-multi",

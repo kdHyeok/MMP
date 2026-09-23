@@ -55,7 +55,7 @@ Resolve the recipient before composing the message:
 
 Resolve the MR number and Jira key from the current conversation, checked-out branch, and current MR. Do not guess. If a value is unresolved, ask only for the missing value or values and never send placeholders.
 
-The rendered result must be exactly one line:
+The layout comes from the stored convention template, which may span several lines (for example a team template that adds `{{mr_url}}` on its own line). The server enforces the content, not the layout: the text must start with the mention or mentions, and contain the status emoji, `!<MR number>`, `[<Jira key>]`, and the message. The `message` and `mentions` values themselves must each be one line. The default single-line layout is:
 
 `<mention> <status emoji> !<MR number> | [<Jira key>] <short message>`
 

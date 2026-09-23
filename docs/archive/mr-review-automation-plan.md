@@ -2,7 +2,7 @@
 
 버전 0.3.0 목표 · 작성일 2026-09-22
 
-> **⚠️ 이 문서의 a)·c) 판단과 4장 아키텍처는 폐기됐습니다.** 감시 대상을 Mattermost 멘션에서 **GitLab todos**로 바꿨고, v0.3.0에 그렇게 구현됐습니다. 실제 설계는 README의 "리뷰 요청 감시" 절과 `skills/auto-review/SKILL.md`를 보세요.
+> **⚠️ 이 문서의 a)·c) 판단과 4장 아키텍처는 폐기됐습니다.** 감시 대상을 Mattermost 멘션에서 **GitLab todos**로 바꿨고, v0.3.0에 그렇게 구현됐습니다. 현재 동작은 [README](../../README.md)의 "Part 2. MR 리뷰 자동화"와 [review-harness.md](../review-harness.md)를 보세요.
 >
 > 바뀐 이유: `glab api todos`가 **기존 인증으로 그냥 읽힙니다.** Mattermost PAT(관리자 활성화 필요)·비공개 채널 문제·WebSocket 감시기·T0/T1/T2 분류·MR 매칭 휴리스틱이 **전부 불필요해집니다.** `action_name`이 리뷰 요청 여부를 알려주고 `target_url`이 그대로 `/mmp:mr-review`의 입력입니다. 실제 계정으로 확인했고, 팀이 `review_requested`를 실제로 쓰고 있었습니다.
 >
