@@ -9,6 +9,7 @@ const PLACEHOLDER_PATTERN = /\{\{([A-Za-z_][A-Za-z0-9_.-]*)\}\}/g;
 const MAX_MESSAGE_LENGTH = 16_000;
 const REVIEW_CONVENTIONS = new Map([
   ["review-request", ":merge_please:"],
+  ["review-request-multi", ":merge_please:"],
   ["review-complete", ":review_complete_shake:"],
 ]);
 const REVIEW_TEXT_PATTERN = /(?:리뷰(?:를)?\s*(?:요청|완료|부탁)|검토\s*부탁|\breview\s+(?:request|requested|complete|completed|please)\b)/iu;
@@ -86,19 +87,42 @@ function variablesIn(template) {
   return [...new Set([...template.matchAll(PLACEHOLDER_PATTERN)].map((match) => match[1]))];
 }
 
-function reviewMessage(conventionName, variables) {
+// 리뷰 메시지는 레이아웃이 아니라 내용을 강제한다.
+// 팀이 템플릿을 바꿔도(줄바꿈 추가, MR URL 포함) 수신자·상태 이모지·MR 번호·지라 키는 틀릴 수 없어야 한다.
+// 고정 문자열과 완전 일치를 요구하면 템플릿을 조금만 손봐도 전송이 통째로 막힌다.
+// 리뷰 컨벤션은 한 명(mention) 또는 여러 명(mentions)을 받는다. 둘 다 같은 규칙으로 검사한다.
+function reviewMentions(variables) {
+  const raw = variables.mention ?? variables.mentions;
+  if (raw === undefined) throw new UserError("Review message requires a mention or mentions variable.");
+  const text = String(raw).trim();
+  if (!text || /[\r\n]/u.test(text)) throw new UserError("Review mentions must be one non-empty line.");
+  for (const one of text.split(/\s+/)) {
+    if (!one.startsWith("@")) throw new UserError("Review mention must start with @.");
+    requireUsername(one.slice(1), "review mention");
+  }
+  return text;
+}
+
+function assertReviewMessage(conventionName, variables, rendered) {
   const emoji = REVIEW_CONVENTIONS.get(conventionName);
-  if (!emoji) return null;
-  const mention = String(variables.mention ?? "");
+  if (!emoji) return;
+  const mentions = reviewMentions(variables);
   const mrNumber = String(variables.mr_number ?? "");
   const jiraKey = String(variables.jira_key ?? "");
   const message = String(variables.message ?? "");
-  if (!mention.startsWith("@")) throw new UserError("Review mention must start with @.");
-  requireUsername(mention.slice(1), "review mention");
   if (!/^\d+$/.test(mrNumber)) throw new UserError("Review mr_number must contain digits only, without !.");
   if (!jiraKey || /[\[\]\r\n]/u.test(jiraKey)) throw new UserError("Review jira_key must be one line without brackets.");
   if (!message.trim() || /[\r\n]/u.test(message)) throw new UserError("Review message must be one non-empty line.");
-  return `${mention} ${emoji} !${mrNumber} | [${jiraKey}] ${message}`;
+
+  // 멘션 바로 뒤는 공백이나 줄바꿈이어야 한다. @kim 이 @kim2 에 우연히 맞는 것을 막는다.
+  const after = rendered.slice(mentions.length);
+  if (!rendered.startsWith(mentions) || (after && !/^\s/.test(after))) {
+    throw new UserError("Review message must begin with the recipient's exact @mention(s).");
+  }
+  if (!rendered.includes(emoji)) throw new UserError(`Review message must include the ${emoji} status emoji.`);
+  if (!rendered.includes(`!${mrNumber}`)) throw new UserError("Review message must include the MR number as !<number>.");
+  if (!rendered.includes(`[${jiraKey}]`)) throw new UserError("Review message must include the Jira key in brackets.");
+  if (!rendered.includes(message)) throw new UserError("Review message must include the supplied message text.");
 }
 
 export function renderTemplate(template, variables = {}) {
@@ -508,10 +532,7 @@ export class MattermostService {
     const convention = this.#convention(conventionName);
     if (!convention) throw new UserError(`Convention '${conventionName}' does not exist.`);
     const text = renderTemplate(convention.template, variables);
-    const expected = reviewMessage(conventionName, variables);
-    if (expected !== null && text !== expected) {
-      throw new UserError(`Convention '${conventionName}' must render the canonical one-line review format.`);
-    }
+    assertReviewMessage(conventionName, variables, text);
     return { conventionName, text };
   }
 
@@ -542,8 +563,14 @@ export class MattermostService {
     const channel = this.#channelForSend(viaChannelName);
     if (!channel) throw new UserError(`Channel '${viaChannelName}' does not exist.`);
     if (!channel.enabled) throw new UserError(`Channel '${viaChannelName}' is disabled.`);
-    if (REVIEW_CONVENTIONS.has(conventionName) && variables.mention !== `@${participant.mattermost_username}`) {
-      throw new UserError("Review DM mention must match the selected participant's Mattermost username.");
+    if (REVIEW_CONVENTIONS.has(conventionName)) {
+      // 여러 명을 부르는 리뷰 컨벤션은 DM 대상이 한 명이라 애초에 성립하지 않는다.
+      if (variables.mentions !== undefined) {
+        throw new UserError("A multi-reviewer review convention cannot be sent as a DM. Send it to a channel instead.");
+      }
+      if (variables.mention !== `@${participant.mattermost_username}`) {
+        throw new UserError("Review DM mention must match the selected participant's Mattermost username.");
+      }
     }
     const rendered = this.#messageText({ conventionName, variables, text });
     const payload = { text: rendered, channel: `@${participant.mattermost_username}` };

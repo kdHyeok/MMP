@@ -39,12 +39,15 @@ These review rules override the Direct Messages section whenever the user asks f
 
 Classify natural variants such as `리뷰 요청 mm에 보내줘`, `리뷰요청 mm으로 보내줘`, or `리뷰 완료 Mattermost에 보내줘`:
 
-- A review request uses convention `review-request`.
+- A review request to **one** person uses convention `review-request` with the `mention` variable.
+- A review request to **several** people uses convention `review-request-multi` with the `mentions` variable. Choose this whenever the user says `팀원 모두`, `전원`, `다같이`, `팀채널에`, names more than one person, or asks to tag a whole channel. Do not send several single-reviewer messages instead.
 - A completed review uses convention `review-complete`.
 
 Resolve the recipient before composing the message:
 
-- For a review request, use the reviewer explicitly selected by the user or recorded on the MR. Never default to the current user.
+- For a single-reviewer request, use the reviewer explicitly selected by the user or recorded on the MR. Never default to the current user.
+- For a multi-reviewer request, call `participant_list` with the destination `channel_name` and take every member **except the one with `is_self: true`**. Join their `mention` values with single spaces, in the order returned. Say in the preview how many people were tagged and that you excluded yourself.
+- `review-request-multi` is a channel message. It cannot be a DM — `message_send_dm` rejects it, because a message addressed to five people has no single recipient. If the user asks to DM several reviewers, say so and offer the channel instead.
 - For a completed review, use the person who requested the review when GitLab or the conversation identifies them. Otherwise use the MR author and say in the preview that the author was used because no distinct requester was available.
 - Read the MR/conversation for that person's GitLab username, then call `participant_list` with `gitlab_username`. Use only the returned `mention`; a display name or GitLab username is not a Mattermost mention.
 - Call `participant_list` with `self_only: true` when current-user identity is relevant, but never use the self profile as the recipient merely because no requester mapping was found.
@@ -56,7 +59,7 @@ The rendered result must be exactly one line:
 
 `<mention> <status emoji> !<MR number> | [<Jira key>] <short message>`
 
-Use `:merge_please:` for a review request and `:review_complete_shake:` for a completed review. Keep the message natural and concise for the current context. Default to `리뷰 부탁드립니당.` or `리뷰 완료 했습니다.` when no more specific wording is needed. Add code-change summaries or verification details only when explicitly requested.
+The mention field holds every reviewer for `review-request-multi`, so the one line begins with all of them: `@a @b @c :merge_please: !194 | [KEY] 리뷰 부탁드립니당.` Use `:merge_please:` for a review request (single or multi) and `:review_complete_shake:` for a completed review. Keep the message natural and concise for the current context. Default to `리뷰 부탁드립니당.` or `리뷰 완료 했습니다.` when no more specific wording is needed. Add code-change summaries or verification details only when explicitly requested.
 
 For a channel review message, call `message_send`. For a review DM, call `message_send_dm` with the resolved participant and `via_channel_name`. In both cases, always pass the matching `convention_name` and these variables; never pass review content through `text`:
 
@@ -77,7 +80,7 @@ The participant directory is global local metadata shared by every logical chann
 
 - Register a person with display name, Mattermost username, optional GitLab username, and optional `is_self`: `participant_create`.
 - List all people, a logical channel's directory, the self profile, or an exact display-name/GitLab/Mattermost match: `participant_list`.
-- For a natural partial name such as `동혁`, call `participant_list` with `name_query`. Strip a conversational trailing `님` before lookup. Do not silently select when multiple rows are returned: show each candidate's display name and Mattermost mention, then ask which person the user means.
+- For a natural partial name such as `철수`, call `participant_list` with `name_query`. Strip a conversational trailing `님` before lookup. Do not silently select when multiple rows are returned: show each candidate's display name and Mattermost mention, then ask which person the user means.
 - Correct a name, identity mapping, or self marker: `participant_update`.
 - Delete a local identity mapping: `participant_delete`.
 - Add or remove a saved participant from a logical channel directory: `channel_member_add` or `channel_member_remove`. If the Mattermost username is absent globally, pass `display_name` so `channel_member_add` creates the global person first and then links it.

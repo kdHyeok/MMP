@@ -2,9 +2,10 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import * as z from "zod/v4";
 import { MattermostService, UserError } from "./core.js";
+import pkg from "../package.json" with { type: "json" };
 
 const service = new MattermostService();
-const server = new McpServer({ name: "mmp", version: "0.2.5" });
+const server = new McpServer({ name: "mmp", version: pkg.version });
 
 const name = z.string().trim().min(1).max(64).regex(/^[\p{L}\p{N}](?:[\p{L}\p{N} ._-]*[\p{L}\p{N}._-])?$/u);
 const nullableText = (max) => z.string().trim().min(1).max(max).nullable().optional();
