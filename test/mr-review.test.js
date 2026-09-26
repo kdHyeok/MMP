@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { HOLD_CATEGORIES, citedLocations, collectAuthorNotes, gateDecision, missingSections, mmQuestions, parseMrUrl, sessionTitleFor, syncMrWorktree, usedHoldCategories } from "../bin/mr-review.mjs";
+import { HOLD_CATEGORIES, citedLocations, collectAuthorNotes, gateDecision, missingSections, mmQuestions, parseMrUrl, sessionTitleFor, syncMrWorktree, usedHoldCategories, verdictProblems } from "../bin/mr-review.mjs";
 
 const bash = (command) => ({ tool_name: "Bash", tool_input: { command } });
 const at = (step, extra = {}) => () => ({ step, iid: 71, project: "group/repo", verdict: "hold", body: "본문", ...extra });
@@ -319,4 +319,42 @@ test("MR의 원격 브랜치를 워크트리로 가져오고 현재 작업 트�
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// 판정은 확인된 지적으로만 한다. 확인하지 못한 것은 지우지 않고 남기되 제목에 드러낸다.
+test("확인하지 못한 지적 수가 제목에 드러나야 한다", () => {
+  const body = (heading) => `${heading}\n요약\n### 확인하지 못한 것\n1. [높음] [확인 필요] 테스트 14개를 돌리지 못했습니다\n### 확인한 범위\n- 전부`;
+  assert.match(verdictProblems("approve", body("## 리뷰 결과: 승인")).join(), /미확인 1건/, "개수를 숨긴 승인은 거부");
+  assert.deepEqual(verdictProblems("approve", body("## 리뷰 결과: 승인 (미확인 1건)")), []);
+  assert.match(verdictProblems("approve", body("## 리뷰 결과: 승인 (미확인 2건)")).join(), /미확인 1건/, "개수가 틀려도 거부");
+
+  // 미확인이 없으면 제목에 괄호를 붙이지 않는다
+  const clean = "## 리뷰 결과: 승인\n요약\n### 확인한 범위\n- 전부";
+  assert.deepEqual(verdictProblems("approve", clean), []);
+  assert.match(verdictProblems("approve", clean.replace("승인", "승인 (미확인 0건)")).join(), /이어야 합니다/);
+});
+
+test("확인된 [높음] 지적이 있으면 승인할 수 없다", () => {
+  const approve = (item) => `## 리뷰 결과: 승인${item.includes("[확인 필요]") ? " (미확인 1건)" : ""}\n요약\n### 고치면 좋을 것\n${item}\n### 확인한 범위\n- 전부`;
+  assert.match(verdictProblems("approve", approve("1. [높음] [정확성] `a.py:3` — 빈 배열에서 터짐")).join(), /승인할 수 없습니다/);
+  assert.deepEqual(verdictProblems("approve", approve("1. [높음] [확인 필요] `a.py:3` — 동시 호출 시 중복 삽입 가능성")), [],
+    "확인하지 못한 [높음]은 막지 않고 제목에만 드러낸다");
+  assert.deepEqual(verdictProblems("approve", approve("1. [중간] `a.py:3` — 로그 문구")), [], "중간·낮음은 승인과 함께 갈 수 있다");
+});
+
+test("보류는 확인된 사유가 하나는 있어야 한다", () => {
+  const hold = (items, count = 0) => [
+    `## 리뷰 결과: 보류${count ? ` (미확인 ${count}건)` : ""}`,
+    "### 왜 보류인가", "이유",
+    "### 수정이 필요한 부분", ...items,
+    "### 확인한 범위", "- `[계약]`: 호출부 `b.py` 확인",
+  ].join("\n");
+
+  assert.deepEqual(verdictProblems("hold", hold(["1. [높음] [정확성] `a.py:3` — 빈 배열에서 터짐"])), []);
+  assert.match(verdictProblems("hold", hold(["1. [높음] [정확성] [확인 필요] `a.py:3` — 아마 터짐"], 1)).join(), /확인된 보류 사유가 없습니다/,
+    "추측만으로는 막지 않는다");
+  assert.match(verdictProblems("hold", hold(["1. [높음] [정확성] — 위치 없이 터진다고만"])).join(), /확인된 보류 사유가 없습니다/,
+    "코드 위치가 같은 줄에 있어야 한다");
+  // 확인한 범위에 적힌 카테고리·인용은 보류 사유로 치지 않는다
+  assert.match(verdictProblems("hold", hold(["1. 이름이 이상함"])).join(), /확인된 보류 사유가 없습니다/);
 });

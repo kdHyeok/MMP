@@ -34,6 +34,59 @@ export function citedLocations(body) {
   return [...String(body).matchAll(/`([^`\n]*\.[A-Za-z0-9]+(?::\d+)?)`/g)].map((match) => match[1]);
 }
 
+// 심각도와 미확인 표시. 태그는 지적 항목의 첫 줄에만 붙인다(확인한 범위에는 쓰지 않는다).
+export const SEVERE = "[높음]";
+export const UNVERIFIED = "[확인 필요]";
+
+// 제목 다음 제목(## 또는 ###)까지의 본문을 돌려준다. 없으면 빈 문자열.
+function sectionOf(body, title) {
+  const text = String(body);
+  const start = text.indexOf(title);
+  if (start < 0) return "";
+  const rest = text.slice(start + title.length);
+  const next = rest.search(/^#{2,3} /m);
+  return next < 0 ? rest : rest.slice(0, next);
+}
+
+// 판정이 지적과 맞는지 본다. 지적을 지우는 기준(반증)과 판정 기준은 다르다 —
+// 확인하지 못한 지적은 지우지 않고 남기되, 판정은 확인된 것으로만 한다.
+//  - 확인하지 못한 지적 수를 제목에 드러낸다: "## 리뷰 결과: 승인 (미확인 2건)"
+//  - 확인된 [높음]이 있으면 승인할 수 없다
+//  - 보류는 확인된 사유(카테고리 태그와 코드 위치가 같은 줄, [확인 필요] 아님)가 하나는 있어야 한다
+export function verdictProblems(verdict, body) {
+  const lines = String(body).split(/\r?\n/);
+  const confirmed = (line) => !line.includes(UNVERIFIED);
+  const problems = [];
+
+  const unverified = lines.filter((line) => line.includes(UNVERIFIED)).length;
+  const heading = `## 리뷰 결과: ${verdict === "hold" ? "보류" : "승인"}`;
+  const expected = unverified ? `${heading} (미확인 ${unverified}건)` : heading;
+  const actual = lines.find((line) => line.startsWith(heading))?.trim();
+  if (actual !== expected) {
+    problems.push(`제목 줄은 \`${expected}\` 이어야 합니다(지금: \`${actual ?? "없음"}\`). `
+      + `확인하지 못한 지적이 몇 건인지 제목에서 보이게 합니다. ${UNVERIFIED} 는 지적 항목에만 쓰세요.`);
+  }
+
+  if (verdict === "approve") {
+    const severe = lines.filter((line) => line.includes(SEVERE) && confirmed(line));
+    if (severe.length) {
+      problems.push(`확인된 ${SEVERE} 지적이 있으면 승인할 수 없습니다. 보류하거나, 확인하지 못했다면 ${UNVERIFIED} 를 붙이세요:\n`
+        + severe.map((line) => `  ${line.trim()}`).join("\n"));
+    }
+  }
+
+  if (verdict === "hold") {
+    const reasons = sectionOf(body, "### 수정이 필요한 부분").split(/\r?\n/).filter((line) => confirmed(line)
+      && HOLD_CATEGORIES.some((category) => line.includes(category))
+      && citedLocations(line).length > 0);
+    if (!reasons.length) {
+      problems.push("`### 수정이 필요한 부분` 에 확인된 보류 사유가 없습니다. 보류 항목은 한 줄에 사유 카테고리와 코드 위치를 함께 적고, "
+        + `${UNVERIFIED} 가 아니어야 합니다. 확인하지 못한 것으로는 병합을 막지 않습니다 — 확인하거나 승인하세요.`);
+    }
+  }
+  return problems;
+}
+
 export class HarnessError extends Error {}
 
 function fail(message) {
@@ -378,6 +431,8 @@ function cmdRecord(verdict, bodyFile) {
     fail("보류 항목은 실제 코드 위치를 인용해야 합니다. 예: `src/service/auth.js:42`\n"
       + "위치를 댈 수 없다면 확인한 것이 아니므로 보류 사유가 될 수 없습니다.");
   }
+  const problems = verdictProblems(verdict, body);
+  if (problems.length) fail(problems.join("\n"));
   return writeState({ ...state, step: "reviewed", verdict, body }, cwd);
 }
 
