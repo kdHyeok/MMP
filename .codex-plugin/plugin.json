@@ -1,7 +1,7 @@
 {
   "name": "mmp",
-  "version": "0.6.1",
-  "description": "Manage Mattermost webhooks, channels, people, conventions, and review messages from Codex.",
+  "version": "0.8.3",
+  "description": "Manage Mattermost messages and GitLab MR review workflows from Codex.",
   "author": {
     "name": "kdHyeok",
     "url": "https://github.com/kdHyeok"
@@ -15,6 +15,7 @@
   ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Mattermost Manager Plugin",
     "shortDescription": "Mattermost 메시지와 로컬 설정을 자연어로 관리",

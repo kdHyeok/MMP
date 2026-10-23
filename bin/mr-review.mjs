@@ -2,10 +2,11 @@
 // MR 리뷰 하네스. prepare → record → post → notify 순서를 상태 파일로 강제한다.
 // 상태 파일은 워크트리별 git 디렉터리에 두므로 워크트리마다 독립이고 커밋되지 않는다.
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { defaultChannel, effectiveMode, readState as readAutoState } from "./bypass-review.mjs";
+import { acquireWatchLock } from "./mr-watch.mjs";
 
 // bypass 동안은 사용자 승인 단계를 건너뛴다. 그 외 모드에서는 평소대로 승인을 요구한다.
 const autoMode = () => effectiveMode(readAutoState());
@@ -21,8 +22,9 @@ export const REQUIRED_SECTIONS = {
 };
 
 // 보류는 "병합 후에 고치면 늦는 것"에만 쓴다. 보류 항목은 아래 중 하나로 분류돼야 한다.
-// 문서·오타·네이밍·취향은 이 목록에 없으므로 자연히 승인+안내 쪽으로 밀린다.
-export const HOLD_CATEGORIES = ["[정확성]", "[안전]", "[데이터]", "[계약]", "[구현]"];
+// 문서가 주목적인 MR의 중요한 내용 수정도 보류 사유다. 사소한 문구·취향은 제외한다.
+export const HOLD_CATEGORIES = ["[정확성]", "[안전]", "[데이터]", "[계약]", "[구현]", "[문서내용]"];
+export const MANUAL_MERGE_GUIDANCE = "위 항목을 수정한 뒤 직접 병합해 주세요.";
 
 export function usedHoldCategories(body) {
   return HOLD_CATEGORIES.filter((category) => String(body).includes(category));
@@ -53,7 +55,7 @@ function sectionOf(body, title) {
 //  - 확인하지 못한 지적 수를 제목에 드러낸다: "## 리뷰 결과: 승인 (미확인 2건)"
 //  - 확인된 [높음]이 있으면 승인할 수 없다
 //  - 보류는 확인된 사유(카테고리 태그와 코드 위치가 같은 줄, [확인 필요] 아님)가 하나는 있어야 한다
-export function verdictProblems(verdict, body) {
+export function verdictProblems(verdict, body, verification = null, title = "") {
   const lines = String(body).split(/\r?\n/);
   const confirmed = (line) => !line.includes(UNVERIFIED);
   const problems = [];
@@ -72,6 +74,17 @@ export function verdictProblems(verdict, body) {
     if (severe.length) {
       problems.push(`확인된 ${SEVERE} 지적이 있으면 승인할 수 없습니다. 보류하거나, 확인하지 못했다면 ${UNVERIFIED} 를 붙이세요:\n`
         + severe.map((line) => `  ${line.trim()}`).join("\n"));
+    }
+    // 제목만으로 분류하지 않는다. 본문·전체 diff를 검토한 분류도 함께 받는다.
+    const documentation = verification?.reviewKind === "documentation" || /^(?:(?:draft|wip):\s*)?docs(?:\([^)]*\))?!?:/i.test(title);
+    if (lines.some((line) => confirmed(line) && (line.includes("[문서내용]") || (documentation && line.includes("[중간]"))))
+      || (Array.isArray(verification?.findings) && verification.findings.some((finding) => finding?.blocking === true
+        || (documentation && ["medium", "high"].includes(finding?.severity))))) {
+      problems.push("병합 차단 사유 또는 문서 중심 MR의 중요한 내용 수정이 있으면 승인할 수 없습니다. 보류로 기록하세요.");
+    }
+    if (lines.some((line) => confirmed(line) && /\[(?:중간|낮음)\]/.test(line))
+      && !sectionOf(body, "### 병합 안내").includes(MANUAL_MERGE_GUIDANCE)) {
+      problems.push("보완 의견이 있는 승인에는 `### 병합 안내`를 추가하세요: " + MANUAL_MERGE_GUIDANCE);
     }
   }
 
@@ -174,16 +187,23 @@ function statePath(cwd = process.cwd()) {
 }
 
 function readState(cwd = process.cwd()) {
+  let path;
+  try { path = statePath(cwd); } catch { return null; } // git 저장소 밖
+  if (!existsSync(path)) return null;
   try {
-    const path = statePath(cwd);
-    return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null;
+    const state = JSON.parse(readFileSync(path, "utf8"));
+    if (!state || !STEPS.includes(state.step)) fail("리뷰 상태 단계가 올바르지 않습니다.");
+    return state;
   } catch {
-    return null; // git 저장소 밖이거나 손상 → 워크플로 밖으로 간주
+    fail(`리뷰 상태 파일이 손상됐습니다. 복구한 뒤 재개하세요: ${path}`);
   }
 }
 
 function writeState(state, cwd = process.cwd()) {
-  writeFileSync(statePath(cwd), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  const path = statePath(cwd);
+  const temp = `${path}.${process.pid}.tmp`;
+  writeFileSync(temp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temp, path);
   return state;
 }
 
@@ -192,8 +212,8 @@ function requireStep(state, expected, hint) {
   if (state.step !== expected) fail(`현재 단계는 '${state.step}'입니다. ${hint} (필요한 단계: '${expected}')`);
 }
 
-function glabJson(args) {
-  const out = run("glab", [...args, "--output", "json"]);
+function glabJson(args, host) {
+  const out = run("glab", [...args, "--output", "json"], { env: { ...process.env, GITLAB_HOST: host } });
   let parsed;
   try {
     parsed = JSON.parse(out);
@@ -203,6 +223,63 @@ function glabJson(args) {
   // glab은 실패해도 exit 0으로 {"error": ...}를 뱉는다. 조용히 빈 필드로 진행하지 않는다.
   if (parsed?.error) fail(`glab 오류 (${args.join(" ")}): ${parsed.error}`);
   return parsed;
+}
+
+function glabApi(endpoint, host, args = []) {
+  const value = JSON.parse(run("glab", ["api", endpoint, "--hostname", host, ...args]));
+  if (!value || value.error || value.message) fail(`GitLab API 오류: ${endpoint}`);
+  return value;
+}
+
+// 리뷰 판단은 모델의 책임이다. 비차단 안내도 검증 기록·댓글과 일치해야 자동 승인한다.
+export function autoApproveProblems(state, mode, mr, pipelines) {
+  const problems = [];
+  if (mode !== "bypass") problems.push("bypass가 꺼져 있습니다.");
+  if (!state || !["posted", "notified"].includes(state.step)) problems.push("MR 답글 게시 후에만 자동 승인할 수 있습니다.");
+  if (state?.verdict !== "approve") problems.push("승인 판정이 아닙니다.");
+  const body = state?.body ?? "";
+  const verification = state?.verification;
+  if (missingSections("approve", body).length || verdictProblems("approve", body, verification, mr?.title ?? state?.title).length
+    || body.includes(UNVERIFIED) || /^### (?:수정이 필요한 부분|확인하지 못한 것)/m.test(body)) {
+    problems.push("승인 가능한 리뷰이고 미확인·병합 차단 사유가 없어야 합니다.");
+  }
+  if (!verification || !Array.isArray(verification.findings)
+    || verification.findings.some((finding) => finding?.blocking !== false || !["low", "medium"].includes(finding?.severity)
+      || typeof finding?.summary !== "string" || !finding.summary.trim())
+    || !Array.isArray(verification.unverified) || verification.unverified.length
+    || !Array.isArray(verification.checks) || !verification.checks.length
+    || verification.checks.some((check) => check?.status !== "passed"
+      || typeof check.name !== "string" || !check.name.trim()
+      || typeof check.evidence !== "string" || !check.evidence.trim())) {
+    problems.push("비차단 지적의 명시적 분류·미확인 0건·필요한 검사 전체 통과 증거가 필요합니다.");
+  }
+  const findings = Array.isArray(verification?.findings) ? verification.findings : [];
+  const tagged = body.split(/\r?\n/).filter((line) => /\[(?:높음|중간|낮음)\]/.test(line));
+  if (findings.length || tagged.length || /^### 고치면 좋을 것/m.test(body)) {
+    const suggestions = sectionOf(body, "### 고치면 좋을 것").split(/\r?\n/).filter((line) => /\[(?:중간|낮음)\]/.test(line));
+    if (!["general", "documentation"].includes(verification?.reviewKind) || !findings.length
+      || tagged.length !== findings.length || suggestions.length !== findings.length
+      || findings.some((finding, index) => !suggestions[index]?.includes(finding?.summary)
+        || !suggestions[index]?.includes(finding?.severity === "medium" ? "[중간]" : "[낮음]")
+        || !citedLocations(suggestions[index]).length)
+      || !sectionOf(body, "### 병합 안내").includes(MANUAL_MERGE_GUIDANCE)) {
+      problems.push("보완 의견은 reviewKind와 findings에 빠짐없이 기록하고 댓글의 위치·심각도·요약을 일치시켜야 합니다. 병합 안내: " + MANUAL_MERGE_GUIDANCE);
+    }
+  }
+  if (!state?.reviewedSha || state.reviewedSha !== state.preparedSha || verification?.sha !== state.reviewedSha
+    || mr?.sha !== state.reviewedSha || mr?.diff_refs?.head_sha !== state.reviewedSha) {
+    problems.push("검토·검증한 커밋과 최신 MR head가 일치하지 않습니다.");
+  }
+  if (mr?.state !== "opened" || mr.draft || mr.work_in_progress || mr.has_conflicts !== false
+    || !["mergeable", "not_approved"].includes(mr.detailed_merge_status)) {
+    problems.push("열린 비-Draft MR이고 충돌·처리 중 상태가 아니어야 합니다.");
+  }
+  // null만으로 CI 부재를 추정하지 않는다. MR 파이프라인 목록도 실제로 비어 있어야 한다.
+  const noCi = mr?.head_pipeline === null && Array.isArray(pipelines) && pipelines.length === 0;
+  if (!noCi && (mr?.head_pipeline?.status !== "success" || mr.head_pipeline.sha !== state?.reviewedSha)) {
+    problems.push("동일 head SHA의 GitLab 파이프라인 성공 또는 CI 없음이 확인돼야 합니다. CI 없음은 로컬 필수 검사 전체 통과로 대체합니다.");
+  }
+  return problems;
 }
 
 function assertGlabAuth(host) {
@@ -262,7 +339,7 @@ export function mainWorktreeRoot(cwd, exec = run) {
 // 세션이 제 브랜치를 달고 있는 워크트리(태스크 워크트리 등)를 MR 브랜치로 갈아끼우면
 // 그 세션의 작업 맥락이 조용히 사라진다. 그럴 땐 전용 워크트리를 따로 만든다.
 // `here: true`는 그 판단을 무시하고 이 자리를 쓴다.
-export function syncMrWorktree({ cwd, remote, iid, sourceBranch, worktreeRoot, here = false }, exec = run) {
+export function syncMrWorktree({ cwd, remote, iid, sourceBranch, worktreeRoot, here = false, keepBranch = false, rereviewSha }, exec = run) {
   let branch = sourceBranch;
   let targetRef = `refs/remotes/${remote}/${sourceBranch}`;
   let forked = false;
@@ -276,11 +353,24 @@ export function syncMrWorktree({ cwd, remote, iid, sourceBranch, worktreeRoot, h
     exec("git", ["fetch", remote, `+merge-requests/${iid}/head:${targetRef}`], { cwd });
   }
 
-  if (isLinkedWorktree(cwd, exec) && (here || exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd }) === branch)) {
+  const linked = isLinkedWorktree(cwd, exec);
+  if (keepBranch && (!here || !linked)) fail("--keep-branch는 리뷰 전용 연결 워크트리에서 --here와 함께 사용하세요.");
+  if (linked && (here || exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd }) === branch)) {
     if (exec("git", ["status", "--porcelain"], { cwd })) {
       fail("이 워크트리에 커밋되지 않은 변경이 있습니다. 정리한 뒤 다시 실행하세요.");
     }
-    checkoutAt(cwd, branch, targetRef, exec);
+    if (rereviewSha) {
+      if (exec("git", ["rev-parse", "HEAD"], { cwd }) !== rereviewSha) fail("이전 리뷰 이후 HEAD가 바뀌었습니다. 로컬 작업을 덮어쓰지 않습니다.");
+      // force-push된 MR도 같은 자리에서 읽되 기존 로컬 브랜치·커밋은 재작성하지 않는다.
+      exec("git", ["checkout", "--detach", targetRef], { cwd });
+      branch = "HEAD";
+    } else if (keepBranch) {
+      // Codex가 관리하는 브랜치/분리 HEAD는 그대로 두고 MR head만 ff-only로 맞춘다.
+      exec("git", ["merge", "--ff-only", targetRef], { cwd });
+      branch = exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
+    } else {
+      checkoutAt(cwd, branch, targetRef, exec);
+    }
     return { path: cwd, branch, targetRef, forked, createdWorktree: false, reusedInPlace: true };
   }
 
@@ -288,6 +378,9 @@ export function syncMrWorktree({ cwd, remote, iid, sourceBranch, worktreeRoot, h
   const registered = exec("git", ["worktree", "list", "--porcelain"], { cwd })
     .split(/\r?\n/)
     .some((line) => line.startsWith("worktree ") && resolve(line.slice(9).trim()) === resolve(path));
+  if (registered && exec("git", ["status", "--porcelain"], { cwd: path })) {
+    fail("리뷰 워크트리에 커밋되지 않은 변경이 있습니다. 정리한 뒤 다시 실행하세요.");
+  }
   if (!registered) {
     mkdirSync(dirname(path), { recursive: true });
     exec("git", refExists(cwd, `refs/heads/${branch}`, exec)
@@ -312,22 +405,45 @@ async function cmdPrepare(rawUrl, flags = {}) {
     fail(`현재 저장소(${remoteUrl})는 MR 프로젝트(${project})가 아닙니다. 해당 저장소에서 실행하세요.`);
   }
 
-  // 진행 중인 다른 MR 리뷰를 덮어쓰지 않는다.
-  const inProgress = readState(cwd);
-  if (inProgress && inProgress.iid !== iid && inProgress.step !== "notified") {
-    fail(`이 워크트리는 MR !${inProgress.iid} 리뷰가 '${inProgress.step}' 단계로 진행 중입니다. 끝내거나 \`reset\` 후 실행하세요.`);
+  // 재전달된 같은 MR도 기존 리뷰 단계를 덮어쓰지 않는다.
+  const inProgress = flags.inspect ? null : readState(cwd);
+  if (inProgress && inProgress.step !== "notified") {
+    fail(`이 워크트리는 MR !${inProgress.iid} 리뷰가 '${inProgress.step}' 단계로 진행 중입니다. status --cwd로 확인하고 기존 단계부터 재개하세요.`);
   }
 
   // --comments 응답은 일반 응답의 상위집합(Discussions가 추가될 뿐)이라 한 번만 부른다.
-  const mr = glabJson(["mr", "view", String(iid), "--repo", project, "--comments"]);
+  const mr = glabJson(["mr", "view", String(iid), "--repo", project, "--comments"], host);
   const authorGitlab = mr.author?.username ?? null;
   // author.name 은 GitLab에 등록된 표시 이름(한글 실명)이다. 세션 제목과 보고에 쓴다.
   const authorName = mr.author?.name ?? authorGitlab;
   if (!mr.source_branch) fail(`MR !${iid}의 source branch를 읽지 못했습니다.`);
 
+  // Codex 관리 워크트리를 만들기 전에 MR의 브랜치와 원격을 확인하는 읽기 전용 경로.
+  if (flags.inspect) return { host, project, iid, remote, sourceBranch: mr.source_branch,
+    headSha: mr.sha ?? mr.diff_refs?.head_sha ?? null,
+    targetBranch: mr.target_branch, sessionTitle: sessionTitleFor({ authorName, iid }) };
+
   const worktreeRoot = flags["worktree-root"] ?? join(mainWorktreeRoot(cwd), ".claude", "worktrees");
+  const targetPath = flags.here ? cwd : join(worktreeRoot, `mr-${iid}`);
+  const previous = readState(targetPath);
+  if (previous && previous.step !== "notified") {
+    fail(`MR !${previous.iid} 리뷰가 '${previous.step}' 단계입니다. status --cwd로 확인하고 기존 단계부터 재개하세요.`);
+  }
+  if (flags["event-id"] && [previous, ...(previous?.history ?? [])].some((round) => round?.eventId === flags["event-id"])) {
+    fail("이 감시 이벤트의 리뷰는 이미 완료됐습니다. 다시 prepare하지 말고 이벤트를 ack하세요.");
+  }
+  const sameMr = previous?.host === host && previous.project === project && previous.iid === iid;
+  if (flags.rereview && (!flags.here || !sameMr || previous.step !== "notified" || !isLinkedWorktree(cwd)
+    || typeof previous.reviewedSha !== "string" || !/^[a-f0-9]{40}$/i.test(previous.reviewedSha)
+    || (previous.eventId && !flags["event-id"]))) {
+    fail("--rereview는 같은 MR의 완료된 리뷰 워크트리에서 --here와 새 --event-id로만 시작하세요.");
+  }
+  if (sameMr && !flags.rereview) fail("같은 MR의 새 리뷰는 기존 워크트리에서 --rereview --here로 시작하세요. 이전 기록은 보존됩니다.");
+  const selfOnly = flags["self-only"] === true || (flags.rereview === true && previous.notificationSelfOnly === true);
   const worktree = syncMrWorktree({
     cwd, remote, iid, sourceBranch: mr.source_branch, worktreeRoot, here: flags.here === true,
+    keepBranch: flags["keep-branch"] === true,
+    rereviewSha: flags.rereview ? previous.reviewedSha ?? previous.preparedSha : undefined,
   });
   // diff base. 없으면 diffCommand가 눈에 띄게 실패하므로 조용히 틀린 범위를 리뷰하는 일은 없다.
   tryRun("git", ["fetch", remote, `+refs/heads/${mr.target_branch}:refs/remotes/${remote}/${mr.target_branch}`], { cwd });
@@ -345,6 +461,7 @@ async function cmdPrepare(rawUrl, flags = {}) {
   let channels = [];
   let hasConvention = false;
   let storageError = null;
+  let notificationRecipient = null;
   try {
     const service = await mattermostService();
     try {
@@ -355,6 +472,11 @@ async function cmdPrepare(rawUrl, flags = {}) {
         mention = participant?.mention ?? null;
         participantId = participant?.id ?? null;
       }
+      if (selfOnly) {
+        const self = service.listParticipants({ selfOnly: true });
+        if (self.length !== 1) fail("본인 전송 제한: isSelf 참여자가 정확히 한 명이어야 합니다.");
+        notificationRecipient = { id: self[0].id, mention: self[0].mention };
+      }
       hasConvention = service.listConventions({ name: "review-complete" }).length > 0;
     } finally {
       service.close();
@@ -362,7 +484,7 @@ async function cmdPrepare(rawUrl, flags = {}) {
   } catch (error) {
     storageError = error.message;
   }
-  const postQuestions = mmQuestions({ authorGitlab, mention, channels, hasConvention, storageError });
+  const postQuestions = mmQuestions({ authorGitlab, mention: notificationRecipient?.mention ?? mention, channels, hasConvention, storageError });
 
   const state = writeState({
     version: 1,
@@ -379,9 +501,13 @@ async function cmdPrepare(rawUrl, flags = {}) {
     targetBranch: mr.target_branch ?? null,
     branch: worktree.branch,
     worktreePath: worktree.path,
+    preparedSha: run("git", ["rev-parse", "HEAD"], { cwd: worktree.path }),
+    notificationSelfOnly: selfOnly,
+    ...(flags.rereview ? { history: [...(previous.history ?? []), Object.fromEntries(Object.entries(previous).filter(([key]) => key !== "history"))] } : {}),
     step: "prepared",
     verdict: null,
     body: null,
+    eventId: flags["event-id"] ?? null,
     preparedAt: new Date().toISOString(),
     postedAt: null,
     notifiedAt: null,
@@ -404,10 +530,11 @@ async function cmdPrepare(rawUrl, flags = {}) {
     diffCommand: `git diff ${remote}/${mr.target_branch}...HEAD`,
     questions,
     postQuestions,
+    notificationRecipient,
   };
 }
 
-function cmdRecord(verdict, bodyFile) {
+function cmdRecord(verdict, bodyFile, flags = {}) {
   const cwd = process.cwd();
   const state = readState(cwd);
   if (!state) fail("먼저 `prepare <MR 링크>`를 실행하세요.");
@@ -421,7 +548,7 @@ function cmdRecord(verdict, bodyFile) {
     fail(`리뷰 본문에 필수 섹션이 없습니다: ${missing.join(", ")}\n보류 사유는 상대가 바로 고칠 수 있게 항목별로 풀어서 써야 합니다.`);
   }
   // 보류하려면 "병합 후에 고치면 늦는 이유"가 카테고리로 분류돼야 한다.
-  // 분류가 안 되는 지적(문서·오타·네이밍·취향)은 보류가 아니라 승인 + 안내다.
+  // 중요한 문서 내용은 분류 대상이다. 사소한 오타·네이밍·취향은 승인 + 안내다.
   if (verdict === "hold" && usedHoldCategories(body).length === 0) {
     fail(`보류하려면 각 항목에 사유 카테고리를 붙여야 합니다: ${HOLD_CATEGORIES.join(" ")}\n`
       + "이 중 어디에도 안 들어가면 병합을 막을 사유가 아닙니다. 승인하고 '고치면 좋을 것'에 적으세요.");
@@ -431,9 +558,37 @@ function cmdRecord(verdict, bodyFile) {
     fail("보류 항목은 실제 코드 위치를 인용해야 합니다. 예: `src/service/auth.js:42`\n"
       + "위치를 댈 수 없다면 확인한 것이 아니므로 보류 사유가 될 수 없습니다.");
   }
-  const problems = verdictProblems(verdict, body);
+  const verification = flags.verification ? JSON.parse(readFileSync(flags.verification, "utf8")) : null;
+  const problems = verdictProblems(verdict, body, verification, state.title);
   if (problems.length) fail(problems.join("\n"));
-  return writeState({ ...state, step: "reviewed", verdict, body }, cwd);
+  const reviewedSha = run("git", ["rev-parse", "HEAD"], { cwd });
+  if (state.preparedSha && state.preparedSha !== reviewedSha) fail("prepare 이후 커밋이 바뀌었습니다. 최신 커밋으로 다시 리뷰하세요.");
+  if (run("git", ["status", "--porcelain"], { cwd })) fail("리뷰 워크트리에 변경이 있습니다. 코드를 수정한 리뷰는 기록하지 않습니다.");
+  return writeState({ ...state, step: "reviewed", verdict, body, reviewedSha, verification }, cwd);
+}
+
+function cmdAutoApprove() {
+  const cwd = process.cwd();
+  const state = readState(cwd);
+  if (!state) fail("먼저 prepare를 실행하세요.");
+  const endpoint = `projects/${encodeURIComponent(state.project)}/merge_requests/${state.iid}`;
+  const mr = glabApi(endpoint, state.host);
+  const pipelines = mr.head_pipeline === null ? glabApi(`${endpoint}/pipelines?per_page=1`, state.host) : undefined;
+  const problems = autoApproveProblems(state, autoMode(), mr, pipelines);
+  if (problems.length) fail(`자동 Approve 제외:\n${problems.join("\n")}`);
+  if (run("git", ["rev-parse", "HEAD"], { cwd }) !== state.reviewedSha
+    || run("git", ["status", "--porcelain"], { cwd })) fail("리뷰 워크트리의 커밋·파일이 변경됐습니다.");
+  const approvals = glabApi(`${endpoint}/approvals`, state.host);
+  if (approvals.user_has_approved !== true) {
+    if (approvals.user_can_approve !== true) fail("현재 계정은 이 MR을 승인할 수 없습니다.");
+    // 서버가 SHA를 비교하므로 조회 직후 push가 와도 다른 커밋을 승인하지 않는다(409).
+    glabApi(`${endpoint}/approve`, state.host, ["--method", "POST", "--raw-field", `sha=${state.reviewedSha}`]);
+  }
+  const verified = glabApi(`${endpoint}/approvals`, state.host);
+  const latest = glabApi(endpoint, state.host);
+  if (verified.user_has_approved !== true || latest.sha !== state.reviewedSha) fail("GitLab 승인 또는 최신 커밋 확인에 실패했습니다. 상태를 재조회하세요.");
+  return writeState({ ...state, approval: { sha: state.reviewedSha, at: new Date().toISOString(),
+    validation: mr.head_pipeline === null ? "local-no-ci" : "ci" } }, cwd);
 }
 
 function cmdPost(flags = {}) {
@@ -441,9 +596,9 @@ function cmdPost(flags = {}) {
   const state = readState(cwd);
   requireStep(state, "reviewed", "`record <approve|hold> <본문파일>`을 먼저 실행하세요.");
   // 권한 프롬프트는 세션 모드(auto 등)에 따라 사람에게 닿지 않는다.
-  // 그래서 승인을 권한 계층이 아니라 대화 계층(AskUserQuestion)에 두고, 여기서 그 증거를 요구한다.
+  // 그래서 승인을 권한 계층이 아니라 대화 계층에 두고, 여기서 그 증거를 요구한다.
   if (flags.confirmed !== true && autoMode() !== "bypass") {
-    fail("게시 전 사용자 승인이 필요합니다.\n1) 답글 전문을 대화에 보여주고\n2) AskUserQuestion으로 게시 여부를 묻고\n3) 승인받은 뒤 `post --confirmed`로 실행하세요.\n"
+    fail("게시 전 사용자 승인이 필요합니다.\n1) 답글 전문을 대화에 보여주고\n2) 사용자에게 게시 여부를 묻고\n3) 승인받은 뒤 `post --confirmed`로 실행하세요.\n"
       + "(전체 무승인으로 돌리려면 `/mmp:bypass-review on`)");
   }
 
@@ -451,7 +606,7 @@ function cmdPost(flags = {}) {
   const args = ["mr", "note", "create", String(state.iid), "--repo", state.project, "--message", state.body, "--unique"];
   // 승인 코멘트가 "모든 스레드 해결" 정책에서 머지를 막지 않도록 비해결형으로 남긴다.
   if (state.verdict === "approve") args.push("--resolvable=false");
-  run("glab", args);
+  run("glab", args, { env: { ...process.env, GITLAB_HOST: state.host } });
 
   return writeState({ ...state, step: "posted", postedAt: new Date().toISOString() }, cwd);
 }
@@ -465,15 +620,18 @@ async function cmdNotify(flags) {
   // bypass 동안은 채널을 묻지 않는다. 설정된 기본 채널을 쓴다.
   const fallbackChannel = autoMode() === "bypass" ? defaultChannel(readAutoState()) : null;
   const viaChannel = flags.channel ?? fallbackChannel ?? fail("--channel <논리채널명> 이 필요합니다(DM에 쓸 웹훅 출처).");
-  const mention = flags.mention ?? state.authorMention ?? fail("--mention @아이디 가 필요합니다.");
   const jira = flags.jira ?? fail("--jira <지라키> 가 필요합니다.");
-  const participantId = Number(flags["participant-id"] ?? state.authorParticipantId);
-  if (!Number.isInteger(participantId) || participantId <= 0) {
-    fail("DM 수신자를 특정하지 못했습니다. `participant_list`로 작성자를 등록한 뒤 --participant-id <숫자> 로 넘기세요.");
-  }
 
   const service = await mattermostService();
   try {
+    const selfOnly = state.notificationSelfOnly || flags["self-only"] === true;
+    const self = selfOnly ? service.listParticipants({ selfOnly: true }) : [];
+    if (selfOnly && self.length !== 1) fail("본인 전송 제한: isSelf 참여자가 정확히 한 명이어야 합니다.");
+    const participantId = Number(selfOnly ? self[0].id : flags["participant-id"] ?? state.authorParticipantId);
+    const mention = selfOnly ? self[0].mention : flags.mention ?? state.authorMention;
+    if (selfOnly && ((flags["participant-id"] && Number(flags["participant-id"]) !== participantId)
+      || (flags.mention && flags.mention !== mention))) fail("본인 전송 제한: 다른 수신자로 변경할 수 없습니다.");
+    if (!Number.isInteger(participantId) || participantId <= 0 || !mention) fail("DM 수신자를 특정하지 못했습니다. 참여자 매핑을 확인하세요.");
     // review-complete 컨벤션이 한 줄 형식과 이모지를 강제하고, 멘션이 수신자와 일치하는지도 검사한다.
     // mr_number는 상태 파일에서 오므로 틀릴 수 없다.
     const sent = await service.sendDirectMessage({
@@ -500,7 +658,7 @@ async function cmdNotify(flags) {
 
 const deny = (reason) => ({ permissionDecision: "deny", permissionDecisionReason: reason });
 // 게이트가 이미 검증한 단계는 권한 프롬프트를 다시 띄우지 않는다.
-// 사용자 확인은 AskUserQuestion(대화 계층) 한 번으로 끝나야지, 승인 직후 또 묻는 건 의미 없는 마찰이다.
+// 사용자 확인은 대화 계층에서 받고, 같은 작업의 권한 프롬프트를 반복하지 않는다.
 const allow = (reason) => ({ permissionDecision: "allow", permissionDecisionReason: reason });
 
 // state는 지연 로딩한다. 문자열만으로 판정되는 금지 항목은 git이 없어도 막혀야 한다.
@@ -512,8 +670,11 @@ export function gateDecision(input, loadState, loadMode = autoMode) {
   // 앵커가 없으면 인용부호나 heredoc 안에 문자열로 적힌 예시까지 차단해 오탐이 실사용을 방해한다.
   const glabMr = (sub) => new RegExp(String.raw`(?:^|[\n;&|(])\s*glab\s+mr\s+${sub}`);
 
-  if (glabMr(String.raw`approve\b`).test(command)) return deny("이 워크플로는 코멘트만 게시합니다. GitLab 승인 버튼은 직접 눌러주세요.");
+  if (glabMr(String.raw`approve\b`).test(command)) return deny("직접 Approve는 금지합니다. 조건을 검증하는 `mr-review.mjs auto-approve`만 사용하세요.");
   if (glabMr(String.raw`merge\b`).test(command)) return deny("머지는 이 워크플로의 범위가 아닙니다.");
+  if (/(?:^|[\n;&|(])\s*glab\s+api\b[^\n;&|]*\/merge_requests\/\d+\/(?:approve|merge)\b/.test(command)) {
+    return deny("직접 승인·병합 API 호출은 금지합니다. 승인은 auto-approve 하네스만 사용하세요.");
+  }
   // `note list`는 읽기 전용이라 막지 않는다. 그 외(기본형 `note <id> -m`, create/update/delete/resolve)는 모두 게시·변경이다.
   // 단, 이 저장소에서 리뷰가 진행 중일 때만 막는다. 진행 중이 아니면 우회할 하네스가 없다 —
   // 작성자가 자기 MR에 리뷰 요청 댓글을 다는 것까지 막으면 그건 오탐이다.
@@ -524,7 +685,7 @@ export function gateDecision(input, loadState, loadMode = autoMode) {
   }
 
   // glab 규칙과 같은 이유로 여기도 명령 위치에 있는 node 실행만 본다.
-  const subs = String.raw`(prepare|record|post|notify|status|reset)`;
+  const subs = String.raw`(prepare|record|post|auto-approve|notify|status|reset)`;
   const nodeCall = (middle) => new RegExp(String.raw`(?:^|[\n;&|(])\s*node\b[^&|;]*?${middle}\s${subs}(?:\s|$)`);
   const explicit = command.match(nodeCall("mr-review[^&|;]*?"));
   // 셸 변수나 별칭으로 우회해도 잡는다. 확신이 없는 이 경로에서는 거부만 하고 자동 승인은 하지 않는다.
@@ -541,13 +702,17 @@ export function gateDecision(input, loadState, loadMode = autoMode) {
   if (!state) return explicit ? deny("`mr-review.mjs prepare <MR 링크>`를 먼저 실행하세요.") : null;
 
   if (sub === "record") return pass("판정 기록 — 하네스가 섹션·카테고리를 검증한다");
+  if (sub === "auto-approve") {
+    if (loadMode() !== "bypass" || !["posted", "notified"].includes(state.step)) return deny("자동 Approve는 bypass 켜짐·게시 완료 후에만 가능합니다.");
+    return pass("자동 Approve — 하네스가 지적·검증 증거·최신 SHA·CI·계정 권한을 재검사한다");
+  }
 
   if (sub === "post") {
     if (state.step === "posted" || state.step === "notified") return deny(`MR !${state.iid} 답글은 이미 게시됐습니다.`);
     if (state.step !== "reviewed") return deny("`record <approve|hold> <본문파일>`을 먼저 실행하세요.");
     // deny는 세션 권한 모드와 무관하게 확정적이다. 승인 증거(--confirmed)가 없으면 확정적으로 막는다.
     if (!/--confirmed\b/.test(command) && loadMode() !== "bypass") {
-      return deny("답글 전문을 대화에 보여주고 AskUserQuestion으로 게시 승인을 받은 뒤 `post --confirmed`로 실행하세요. 권한 프롬프트는 이 확인을 대신하지 못합니다.");
+      return deny("답글 전문을 대화에 보여주고 사용자에게 게시 승인을 받은 뒤 `post --confirmed`로 실행하세요. 권한 프롬프트는 이 확인을 대신하지 못합니다.");
     }
     return pass(`MR !${state.iid} 답글 게시`);
   }
@@ -556,14 +721,27 @@ export function gateDecision(input, loadState, loadMode = autoMode) {
   return pass("리뷰 완료 DM — 게시 완료 후 자동 전송");
 }
 
+export function gateCwd(input) {
+  const command = String(input?.tool_input?.command ?? "");
+  const base = input?.tool_input?.cwd ?? input?.tool_input?.workdir ?? input?.cwd ?? process.cwd();
+  // ponytail: 전체 셸 파서는 아니다. 하네스는 독립 명령과 리터럴 --cwd로 호출한다.
+  const explicit = command.includes("mr-review.mjs")
+    ? command.match(/(?:^|\s)--cwd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/)
+    : null;
+  if (explicit) return resolve(base, explicit[1] ?? explicit[2] ?? explicit[3]);
+  const cd = command.match(/^\s*(?:cd|Set-Location(?:\s+-LiteralPath)?)\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*(?:&&|;)/i);
+  return cd ? resolve(base, cd[1] ?? cd[2] ?? cd[3]) : base;
+}
+
 async function cmdGate() {
   let raw = "";
   for await (const chunk of process.stdin) raw += chunk;
   let decision = null;
   try {
-    decision = gateDecision(JSON.parse(raw || "{}"), () => readState());
+    const input = JSON.parse(raw || "{}");
+    decision = gateDecision(input, () => readState(gateCwd(input)));
   } catch {
-    decision = null; // 게이트가 깨져도 세션을 막지 않는다
+    decision = deny("MR 리뷰 게이트 입력 또는 상태를 읽지 못했습니다. 상태를 확인한 뒤 다시 실행하세요.");
   }
   if (decision) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", ...decision } }));
   return null;
@@ -588,10 +766,19 @@ function parseFlags(argv) {
 
 async function main(argv) {
   const [command, ...rest] = argv;
+  const flags = parseFlags(rest);
+  if (flags.cwd !== undefined) {
+    if (typeof flags.cwd !== "string" || !flags.cwd.trim()) fail("--cwd에는 작업 디렉터리를 지정하세요.");
+    process.chdir(flags.cwd);
+  }
+  if (flags["event-id"] !== undefined && (typeof flags["event-id"] !== "string" || !flags["event-id"].trim())) {
+    fail("--event-id에는 감시 이벤트 식별자를 지정하세요.");
+  }
   switch (command) {
     case "prepare": return cmdPrepare(rest[0], parseFlags(rest.slice(1)));
-    case "record": return cmdRecord(rest[0], rest[1]);
+    case "record": return cmdRecord(rest[0], rest[1], flags);
     case "post": return cmdPost(parseFlags(rest));
+    case "auto-approve": return cmdAutoApprove();
     case "notify": return cmdNotify(parseFlags(rest));
     case "status": return readState() ?? { step: null };
     case "reset": {
@@ -601,17 +788,25 @@ async function main(argv) {
     }
     case "gate": return cmdGate();
     default:
-      return fail(`알 수 없는 명령: ${command ?? "(없음)"}\n사용: prepare | record | post | notify | status | reset | gate\n단계: ${STEPS.join(" → ")}`);
+      return fail(`알 수 없는 명령: ${command ?? "(없음)"}\n사용: prepare | record | post | auto-approve | notify | status | reset | gate\n단계: ${STEPS.join(" → ")}`);
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main(process.argv.slice(2))
+  const args = process.argv.slice(2);
+  const flags = parseFlags(args.slice(1));
+  let release;
+  Promise.resolve().then(() => {
+    if (["record", "post", "auto-approve", "notify", "reset"].includes(args[0]) || (args[0] === "prepare" && !flags.inspect)) {
+      release = acquireWatchLock(`${statePath(flags.cwd ?? process.cwd())}.lock`);
+    }
+    return main(args);
+  })
     .then((result) => {
       if (result !== null && result !== undefined) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     })
     .catch((error) => {
       process.stderr.write(`${error instanceof HarnessError ? error.message : `실패: ${error.message}`}\n`);
-      process.exit(1);
-    });
+      process.exitCode = 1;
+    }).finally(() => release?.());
 }

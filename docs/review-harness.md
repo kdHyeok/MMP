@@ -9,7 +9,9 @@ README의 "MR 리뷰 자동화"가 **무엇을 하는지**를 설명한다면, �
 | `bin/mr-review.mjs` | 리뷰 하네스. 단계를 상태 파일로 강제하고, PreToolUse 훅의 게이트도 겸한다 |
 | `bin/mr-watch.mjs` | GitLab todos 폴러. 리뷰 요청을 한 줄 JSON 이벤트로 내보낸다 |
 | `bin/bypass-review.mjs` | 승인 정책(`bypass` 켜짐/꺼짐)과 기본 채널을 저장한다 |
-| `hooks/hooks.json` | `glab` 과 `node` 로 시작하는 Bash 명령을 게이트로 보낸다 |
+| `hooks/hooks.json` | Bash/PowerShell 명령을 공통 게이트로 보낸다. Codex exec_command는 Bash로 정규화된다 |
+| `src/paths.js` | MCP·감시·bypass의 공통 데이터 디렉터리 계산 |
+| `skills/references/` | Claude Code / Codex 실행 수단 안내. 판정 기준은 공통 스킬에 유지 |
 | `skills/mr-review/SKILL.md` | 리뷰 절차 — 위험 지도, 빈틈 찾기, 필터, 심각도와 판정 기준 |
 | `skills/mr-review/checklists/` | 언어별 점검 목록 (현재 Python). open-code-review에서 가져옴 |
 | `skills/auto-review/SKILL.md` | 감시 절차 — 밀린 요청, 재무장, 칩 또는 인라인 리뷰 |
@@ -22,7 +24,7 @@ README의 "MR 리뷰 자동화"가 **무엇을 하는지**를 설명한다면, �
 상태는 리뷰가 일어나는 워크트리의 `<git-dir>/mmp-mr-review.json` 에 저장됩니다. 워크트리마다 독립이고 커밋되지 않습니다.
 
 ```
-prepared → reviewed → posted → notified
+prepared → reviewed → posted → (조건부 auto-approve) → notified
 ```
 
 | 단계 | 하는 일 | 강제 방식 |
@@ -32,6 +34,7 @@ prepared → reviewed → posted → notified
 | 필터 | 기록 직전, **코드가 틀렸다고 보여주는 지적만** 지운다. 확인하지 못한 지적은 지우지 않고 `[확인 필요]` 를 붙인다 | 스킬 |
 | `record <approve\|hold> <본문파일>` | 판정과 답글 본문 기록 | 필수 섹션·태그·인용, 판정 일관성(아래 "판정 검사")을 어기면 거부 |
 | `post` | `glab mr note create --unique` 로 답글 게시 | `reviewed` 가 아니면 거부, 이미 게시했으면 거부. `bypass` 가 아니면 `--confirmed` 없이 거부 |
+| `auto-approve` | GitLab 승인 API에 검토한 SHA를 전달 | 아래 모든 조건 만족 시만 허용. 이미 승인했으면 재검증하고 중복 POST하지 않음 |
 | `notify` | `review-complete` 컨벤션으로 MR 작성자에게 DM | `posted` 가 아니면 거부 |
 
 ### 필수 섹션
@@ -47,6 +50,8 @@ prepared → reviewed → posted → notified
 |---|---|
 | 미확인 개수 | 제목이 `## 리뷰 결과: <판정> (미확인 N건)` 이 아니거나 N이 `[확인 필요]` 줄 수와 다름. 0건이면 괄호가 없어야 함 |
 | 승인 | 확인된 `[높음]` 줄이 하나라도 있음 |
+| 문서 중심 승인 | 확인된 `[문서내용]` 또는 문서 중심의 `[중간]` 이상 지적, 검증 기록에 명시된 병합 차단 사유가 있음 |
+| 보완 의견이 있는 승인 | `### 병합 안내`에 “위 항목을 수정한 뒤 직접 병합해 주세요.”가 없음 |
 | 보류 | `### 수정이 필요한 부분` 에 **카테고리 태그와 코드 위치가 한 줄에 함께 있고 `[확인 필요]` 가 아닌** 줄이 하나도 없음 |
 
 확인한 범위에 적힌 카테고리·인용은 보류 사유로 치지 않습니다. 보류 사유는 수정이 필요한 부분에만 있어야 합니다.
@@ -69,6 +74,7 @@ prepared → reviewed → posted → notified
 | 지적 | 판정 |
 |---|---|
 | 확인된 `[높음]` | 보류 |
+| 문서 중심 MR의 중요한 내용 수정 | 보류 (`[중간] [문서내용]` 이상) |
 | 확인된 `[중간]` | "병합 후에 고쳐도 되는가?" — 아니오면 보류 |
 | `[낮음]` | 승인 + 안내 |
 | `[확인 필요]` | 막지 않음. 제목에 개수 |
@@ -92,16 +98,17 @@ prepared → reviewed → posted → notified
 | `[데이터]` | 데이터 손상·유실 |
 | `[계약]` | API·스키마·문서 계약 위반 (문서 때문에 실제로 깨지는 경우 포함) |
 | `[구현]` | MR이 주장한 기능이 구현되지 않음 |
+| `[문서내용]` | 문서 중심 MR의 핵심 사실·일정·설계 오류, 중요한 누락·모순 |
 
 코드 위치는 백틱으로 감싼 `파일.확장자` 또는 `파일.확장자:줄` 형태여야 합니다(`` `src/auth.js:42` ``). 위치를 댈 수 없으면 확인한 것이 아니므로 남의 병합을 막지 않습니다.
 
-## 왜 권한 프롬프트가 아니라 AskUserQuestion 인가
+## 왜 권한 프롬프트가 아니라 대화에서 확인하는가
 
-훅의 `ask` 결정은 세션 권한 모드에 따라 사람에게 닿지 않습니다. auto 모드에서는 분류기가 대신 해소하고, 사용자가 앞서 "코멘트 남겨줘"라고 말했으면 그 발화가 승인으로 읽힙니다. 그래서 게시 승인을 권한 계층이 아니라 대화 계층(`AskUserQuestion`)에 두고, 하네스와 게이트는 그 증거인 `--confirmed` 를 요구합니다. `deny` 는 모드와 무관하게 확정적입니다.
+게시 전문을 보여주고 대화에서 사용자 응답을 받은 뒤 `--confirmed`를 전달합니다. Claude는 AskUserQuestion, Codex는 제공되는 질문 도구 또는 대화를 사용합니다. 훅의 권한 프롬프트만으로 게시 내용에 동의했다고 가정하지 않습니다. bypass는 이 확인 정책만 면제하며 형식·단계 검증과 Codex 권한·샌드박스는 그대로입니다.
 
 ## 게이트 규칙
 
-`hooks/hooks.json` 이 `glab *` 과 `node *` Bash 명령을 `mr-review.mjs gate` 로 보냅니다. 명령 위치(문자열 시작, 또는 `;` `&` `|` `(` 줄바꿈 뒤)에 있는 호출만 봅니다 — 문자열 안에 예시로 적힌 명령까지 막으면 문서 작업이 막히기 때문입니다.
+`hooks/hooks.json`이 Bash/PowerShell 명령을 `mr-review.mjs gate`로 보냅니다. Codex manifest가 이 파일을 명시적으로 참조하고 설치 스크립트가 bin/hooks를 함께 배포합니다. Codex에서는 훅 검토·신뢰가 필요합니다. 상태는 훅의 작업 경로 또는 명령의 리터럴 `--cwd`에서 읽습니다. 명령 위치(문자열 시작, 또는 `;` `&` `|` `(` 줄바꿈 뒤)에 있는 호출만 봅니다.
 
 | 명령 | 결정 |
 |---|---|
@@ -111,14 +118,35 @@ prepared → reviewed → posted → notified
 | 하네스 `prepare` · `status` · `reset` | 자동 승인 |
 | 하네스 `record` | 상태가 있으면 자동 승인 |
 | 하네스 `post` | 단계·중복·`--confirmed`(bypass 제외) 검사 후 승인 또는 거부 |
+| 하네스 `auto-approve` | bypass·게시 완료 확인 후 하네스에서 증거·SHA·CI·계정 권한 재검사 |
 | 하네스 `notify` | `posted` 일 때만 자동 승인 |
 | 셸 변수·별칭으로 부른 하네스 | 거부만 하고 자동 승인은 하지 않는다 (우리 하네스라고 확신할 수 없음) |
 
 알려진 한계: 정규식은 heredoc 경계를 모릅니다. 커밋 메시지 본문의 한 줄이 승인·머지 명령으로 시작하면 명령으로 오인해 막습니다. 백틱으로 감싸거나 문장 중간에 두면 됩니다.
 
+### 조건부 GitLab 승인
+
+`record --verification <JSON파일>`로 `{sha, reviewKind:"general", findings:[], unverified:[], checks:[{name,status:"passed",evidence}]}`를 함께 저장합니다. 기존 record도 호환되지만 증거가 없으므로 자동 Approve하지 않습니다. 승인 판정·병합 차단 사유 없음·미확인 0건, 필요한 검사 전체 통과, bypass ON, 게시 완료, prepared/reviewed/검증/MR head SHA 일치가 모두 필요합니다. 열린 비-Draft·충돌 없음·처리 완료(`mergeable` 또는 `not_approved`)를 요구합니다. CI가 있으면 같은 SHA의 성공이 필요하고, CI가 없는 MR은 로컬 필수 검사 전체 통과로 대체합니다. CI 없음은 `head_pipeline=null`과 실제 `/pipelines?per_page=1` 응답의 빈 배열을 모두 확인한 경우뿐입니다. 미조회·권한 실패·파싱 실패·실행 중·실패·스킵·다른 SHA의 CI는 로컬 검증으로 우회하지 않습니다. 승인 기록의 `approval.validation`은 `ci` 또는 `local-no-ci`입니다.
+
+문서 중심 MR은 `reviewKind:"documentation"`으로 분류합니다. 본문·전체 diff로 판단하며 `docs(docs):`·`docs:` 제목은 하네스도 문서 중심으로 취급합니다. 중요한 내용 수정은 `[문서내용]`으로 보류하고 사소한 오타·문체·서식만 승인합니다. 일반 MR은 비차단 코드·문서 보완 의견이 있어도 자동 Approve 대상입니다. 지적이 있으면 `findings:[{severity:"low" 또는 "medium",blocking:false,summary:"요약"}]`를 기록합니다. 댓글의 `### 고치면 좋을 것`에 같은 순서·개수·심각도·동일 요약과 파일 위치를 쓰고 수정 방향을 덧붙입니다. `### 병합 안내`에는 “위 항목을 수정한 뒤 직접 병합해 주세요.”를 필수로 넣습니다. 누락·불일치·병합 차단 지적·문서 중심의 medium 이상 지적은 자동 승인하지 않습니다. `record`도 확인된 중요한 문서 지적과 병합 차단 지적의 승인 및 보완 승인 댓글의 수동 병합 안내 누락을 거부합니다. 기존 무지적 검증 JSON은 호환됩니다. 새 수정 커밋은 새 SHA 리뷰가 필요하며 GitLab 승인 초기화 정책을 우회하지 않습니다.
+
+`auto-approve`는 `/approvals`로 현재 계정의 승인 가능·기승인 여부를 확인하고, `/approve`에 `sha`를 전달합니다. 조회 후 push는 GitLab의 409로 차단합니다. 실행 후 승인·head를 재조회해 기록합니다. CLI의 상태 변경은 워크트리별 잠금과 원자적 파일 교체로 직렬화합니다. 리뷰/검사 증거의 진실성 자체는 모델의 책임이며 하네스가 증명하지 못합니다. 직접 `glab mr approve`, 승인/병합 API 호출 및 Merge는 여전히 훅에서 거부합니다. 훅은 정규식 기반의 보조 장치이지 모든 임의 실행을 차단하는 보안 경계는 아닙니다.
+
+본인 DM 제한은 `prepare --self-only`로 리뷰 상태에 저장하고 `notify`가 등록된 `isSelf` 수신자 한 명만 선택합니다. 명시적 다른 수신자 옵션도 거부하며, 일반적인 작성자 DM 흐름은 그대로 유지합니다.
+
+### Codex 독립 리뷰 채팅과 병합 후 보관
+
+사용자가 독립 채팅 생성을 승인한 감시에서는 **MR 최초 요청에만** `create_thread`의 프로젝트 워크트리 환경으로 새 채팅을 만듭니다. 감시기는 앱 API를 직접 호출하지 않으며 스킬/heartbeat가 조율합니다. `--session-claim <eventId>`를 생성 전 저장하고 생성 후 `--session-bind <eventId> --thread-id <실제ID> --worktree-path <절대경로>`를 저장합니다. 같은 호스트·프로젝트·MR의 새 요청이면 기존 레코드의 `eventIds`에 연결하고 `reused=true`를 반환하므로 새 채팅·워크트리를 만들지 않습니다. 기존의 eventId 전용 레코드도 호환됩니다. 기존 중복은 삭제하지 않고 새 이벤트를 최초 연결 채팅에 모으며, 이미 연결된 다른 이벤트의 채팅은 재연결하지 않습니다. 대기 생성의 clientThreadId는 별도 필드로 저장합니다. 결과가 불명확해도 claim을 지우고 재생성하지 않습니다. 기존 채팅을 조회해 연결하거나 사용자 조치를 요청합니다.
+
+새 재리뷰 회차는 이전 회차가 `notified`인 같은 MR의 연결 워크트리에서 `prepare --rereview --here --keep-branch --event-id <새ID>`로 시작합니다. 기존 본문·검증·게시·승인·알림을 history에 보존하고 새 회차에 재사용하지 않습니다. 본인 수신 제한은 이어받습니다. dirty 파일이나 이전 검토 SHA와 다른 HEAD면 거부하며, force-push된 MR은 깨끗한 이전 리뷰 HEAD를 확인한 뒤 같은 자리에서 새 head를 detach checkout합니다. 기존 로컬 브랜치와 커밋은 재작성하지 않습니다. prepare도 상태 잠금을 사용합니다. 실행 중·사용자 확인 대기 회차는 감시 채팅에서 대신 처리하지 않으며 같은 이벤트 재전달은 새 회차가 아닙니다.
+
+`watch-state.json.sessions`는 큐와 별도로 유지됩니다. ack해도 삭제하지 않으며 `--sessions --check`가 각 MR의 현재 상태와 `archiveEligible`을 반환합니다. 실제 병합된 세션만 앱의 `set_thread_archived`로 보관하고 성공 뒤 `--session-archived <eventId>`로 기록합니다. 닫힘/실패/미연결 세션은 보관하지 않고, API 오류는 재시도 대상으로 남습니다. 감시 채팅은 보관하지 않으며 플러그인은 워크트리를 직접 삭제하지 않습니다. 다만 앱은 채팅 보관 시 관리 워크트리를 스냅샷 후 자동 정리할 수 있습니다([공식 정책](https://learn.chatgpt.com/docs/environments/git-worktrees)). 새 요청 감시의 중지·만료 후에도 남은 세션의 병합 확인은 계속합니다(사용자가 전체 중지를 요청한 경우 제외).
+
 ## 워크트리 규칙
 
 기본 위치는 `<메인 저장소>/.claude/worktrees/mr-<iid>` 입니다(`--worktree-root` 로 변경).
+
+Codex는 `prepare --inspect`로 MR 정보를 읽고 관리 워크트리를 준비한 뒤 `--here --keep-branch --cwd <경로>`로 리뷰 상태를 기록합니다. 관리 브랜치 이름/분리 HEAD를 바꾸지 않고 MR head로 ff-only 갱신합니다. 관리 도구가 없으면 `.mmp-worktrees` 같은 명시적 위치를 사용합니다. `--event-id`는 감시 이벤트와 리뷰 상태를 연결합니다. 재전달 때문에 진행/게시/알림 상태를 prepare로 덮어쓰지 않습니다.
 
 - 지금 서 있는 곳이 연결된 워크트리이고 이미 그 MR 브랜치면 그 자리를 씁니다
 - 연결된 워크트리지만 다른 브랜치로 작업 중이면 **갈아끼우지 않고** 전용 워크트리를 따로 만듭니다
@@ -126,7 +154,7 @@ prepared → reviewed → posted → notified
 - 커밋되지 않은 변경이 있는 워크트리는 거부합니다
 - 포크 MR이라 원격에 소스 브랜치가 없으면 `merge-requests/<iid>/head` 로 폴백합니다
 
-세션은 워크트리가 새로 만들어지면 `EnterWorktree` 로 들어갑니다. `cd` 는 셸 한 줄에만 적용돼 데스크톱 앱에 보이지 않습니다. 감시(bypass) 경로는 리뷰가 끝나면 `ExitWorktree({action: "keep"})` 으로 나옵니다 — 리뷰는 커밋을 남기지 않아 `remove` 하면 워크트리가 사라집니다.
+Claude 세션은 워크트리가 새로 만들어지면 `EnterWorktree`로 들어가고 인라인 감시 리뷰가 끝나면 `ExitWorktree({action: "keep"})`으로 나옵니다. Codex는 관리 워크트리의 경로를 셸 workdir와 하네스 --cwd에 명시합니다. 셸 한 줄의 cd가 다음 호출에 유지된다고 가정하지 않습니다. 양쪽 모두 리뷰 종료 직후 워크트리를 자동 삭제하지 않습니다.
 
 ## 세션 제목
 
@@ -139,17 +167,24 @@ prepared → reviewed → posted → notified
 | 판정 | `action_name` |
 |---|---|
 | 확정 — 판단 없이 리뷰 | `review_requested`, `approval_required` |
-| 판단 필요 — 댓글 본문을 보고 결정 | `directly_addressed`, `mentioned` |
+| 실제 MR 작성자의 명시적 요청 댓글 조회·검증 후만 허용 | `directly_addressed`, `mentioned` |
 | 제외 | `assigned` 및 그 외 |
 
 - `watch.json` 에 없는 프로젝트의 todo는 무시합니다
 - 첫 실행 시각을 `since` 로 저장하고 그 이전 todo는 재생하지 않습니다
-- 처리한 todo id는 `watch-state.json` 의 `seen` 에 최근 500개까지 둡니다. GitLab의 todo를 done 처리하지 않습니다 — 상대의 GitLab 상태를 바꾸는 일이기 때문입니다
+- 처리한 todo id는 pending에 남은 동안 기억하고 GitLab에서 사라진 것만 정리합니다. 감지 이벤트는 queue에 먼저 저장하고 ack 전까지 재전달합니다. GitLab todo를 done 처리하지 않습니다
 - 같은 폴링 배치 안에서 한 MR에 여러 todo가 오면 하나로 합치고, 확정 액션을 남깁니다. 배치를 넘어선 중복은 합치지 않습니다 — 수정 후 재리뷰 요청은 별개 사건입니다
+- 멘션은 MR 제목/todo.body가 아닌 `#note_ID`의 실제 댓글·작성자·system=false·MR opened를 조회합니다. 명시적인 한/영 리뷰 요청만 자동 처리하고 결과 보고·질문·감사·인용·부정·다른 리뷰어 댓글은 제외합니다. 미지원/애매한 표현은 수동 요청이 필요합니다. 큐 재전달도 실제 댓글을 재검사해 비요청은 `review_ignored`, `reviewRequested=false`로 출력합니다. 조회 오류를 요청/제외로 확정하지 않으며 큐를 지우지 않습니다. 기존 백로그의 제외 ack는 사용자 선택 범위를 따릅니다.
 - MR에 답글을 달면 GitLab이 그 MR의 내 todo를 자동으로 done 으로 넘깁니다. 게시한 MR이 밀린 목록에서 사라지는 건 이 때문입니다
 - `host` 가 설정에 없으면 `glab auth status` 에서 `Logged in to <호스트>` 가 정확히 하나일 때만 그것을 씁니다. `glab auth status` 는 다른 호스트가 401이어도 종료 코드 0이고 출력이 전부 stderr 라서, 종료 코드가 아니라 출력 문자열로 판정합니다
 
-`Monitor` 는 최대 30분이라 스킬이 만료 때마다 재무장합니다. 재무장 횟수는 대화 맥락으로 세며, 컨텍스트가 압축되면 0부터 다시 셉니다.
+Claude Monitor는 만료 시 저장된 active/종료 시각을 확인해 재무장합니다. Codex는 현재 채팅의 반복 자동화에서 `--once --client codex`를 실행합니다. 실제 실행 주기는 자동화 도구가 허용하는 값을 사용합니다. 자동화 도구가 없으면 지속 감시를 활성화했다고 보고하지 않습니다.
+
+`--start --client <claude|codex> --hours <시간>`은 종료 시각과 소유 클라이언트를 저장합니다. `--forever`는 사용자가 끌 때까지 요청했을 때 사용합니다. `--stop`은 대기 목록을 유지하며, 다음 start에서 재개합니다. run 잠금은 동시 폴러를 막고 state 잠금은 ack/상태 갱신을 직렬화합니다. 상태는 임시 파일에 쓴 뒤 rename합니다. 강제 종료로 남은 잠금은 자동 삭제하지 않고 PID와 정확한 경로를 보고합니다.
+
+## 호환성 검증
+
+`npm test`는 공통 기능과 Codex 설치본, 작업 경로를 전달하는 훅, 감시 대기·ack·종료·재개, 관리 브랜치 유지, 격리된 리뷰 CLI 흐름을 검사합니다. CLI 흐름 테스트는 glab만 모의 응답으로 바꾸고 git/SQLite/로컬 HTTP 전송은 실제 실행합니다. `npm run smoke`는 MCP 초기화와 22개 도구 목록·저장소 조회·참여자 CRUD를 검사합니다. 실제 계정의 MR 게시·DM 및 Codex 앱의 훅 신뢰/자동화 스케줄러 실행은 별도 환경 검증입니다.
 
 ## 설계 기록
 

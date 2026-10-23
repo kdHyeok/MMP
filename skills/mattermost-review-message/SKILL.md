@@ -1,6 +1,6 @@
 ---
 name: mattermost-review-message
-description: Use the mmp MCP for natural-language mm/Mattermost channel or DM messages and lightweight webhook, channel, or global-person CRUD. Resolve people safely through saved identity mappings and remember an approved default channel only within the current Codex task.
+description: Use the mmp MCP for natural-language mm/Mattermost channel or DM messages and lightweight webhook, channel, or global-person CRUD. Resolve people safely through saved identity mappings and remember an approved default channel only within the current client session.
 ---
 
 # Mattermost Manager
@@ -16,7 +16,7 @@ Use the `mmp` MCP. Never hard-code or assume a channel name.
 
 ## Session Default Channel
 
-- A session means the current Codex task. Do not persist its default channel to SQLite or reuse it in another task.
+- A session means the current client conversation (a Codex task or Claude Code session). Do not persist its default channel to SQLite or reuse it in another conversation.
 - Start with no session default. On the first send without an explicit channel, call `channel_list` and show the registered logical channel names before asking which one to use. Ask even when exactly one channel is registered; never select it automatically.
 - Only enabled channels are selectable for sending. If the user chooses a disabled channel, ask whether to enable it with `channel_update` before sending.
 - Show the exact pending message with the channel choices. Selecting a channel authorizes sending that displayed message there. After a successful send, remember the selected channel as this task's default.

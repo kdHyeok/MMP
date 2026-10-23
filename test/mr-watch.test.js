@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAYBE_ACTIONS, REVIEW_ACTIONS, loadConfig, loggedInHosts, selectTodos } from "../bin/mr-watch.mjs";
+import { MAYBE_ACTIONS, REVIEW_ACTIONS, isExplicitReviewRequest, loadConfig, loggedInHosts, reviewEvent, selectTodos, verifyCommentRequest } from "../bin/mr-watch.mjs";
 
 const PROJECTS = { "g/repo": { workdir: "C:/work/repo", jiraBaseUrl: "https://jira.example.com/browse" } };
 
@@ -37,11 +37,41 @@ test("리뷰어 지정은 판정 없이 확정으로 흘린다", () => {
   assert.equal(pick([todo({ action_name: "approval_required" })])[0].certain, true);
 });
 
-test("멘션은 확정이 아니라 body로 판단하도록 넘긴다", () => {
+test("멘션은 실제 작성자의 명시적인 리뷰 요청 검증이 있어야 넘긴다", () => {
   for (const action of MAYBE_ACTIONS) {
-    const [one] = pick([todo({ action_name: action })]);
+    assert.deepEqual(pick([todo({ action_name: action, body: "리뷰 부탁드립니다" })]), [], "todo 본문만 믿지 않는다");
+    const [one] = pick([todo({ action_name: action, body: "리뷰 부탁드립니다", reviewRequestVerified: true })]);
     assert.equal(one.certain, false, action);
   }
+});
+
+test("일반 질문·리뷰 완료·감사·부정·인용은 자동 리뷰 요청이 아니다", () => {
+  for (const body of ["수정 반영했습니다. 재 리뷰 요청드립니다!", "@user 리뷰 부탁드립니다.", "다시 리뷰해주세요", "리뷰 좀 해주실 수 있나요?",
+    "@user please review again", "Could you re-review this MR?", "Requesting another review"]) assert.equal(isExplicitReviewRequest(body), true, body);
+  for (const body of ["@user 확인 부탁드립니다", "리뷰 완료했습니다. 이 부분을 수정하고 직접 병합해 주세요.", "리뷰 감사합니다", "리뷰 요청 감사합니다",
+    "재리뷰 요청 처리 완료", "리뷰 부탁드렸습니다", "리뷰 요청이 아닙니다", "리뷰하지 마세요", "리뷰 필요 없습니다", "리뷰해주실 필요 없습니다", "Don't review this",
+    "> 리뷰 부탁드립니다\n검토 결과를 공유합니다.", '"리뷰 부탁드립니다"라는 문구입니다.', "```\n리뷰 부탁드립니다\n```", "```\n리뷰 부탁드립니다", "`please review`",
+    "## 리뷰 결과: 승인\n확인한 요청: 리뷰 부탁드립니다", ""]) {
+    assert.equal(isExplicitReviewRequest(body), false, body);
+  }
+});
+
+test("실제 댓글 ID·MR 작성자·시스템 여부·열린 MR까지 대조하며 legacy 큐도 재검사한다", () => {
+  const raw = todo({ action_name: "mentioned", target_url: "https://gitlab.example.com/g/repo/-/merge_requests/185#note_9" });
+  const note = { id: 9, system: false, body: "수정했습니다. 재리뷰 요청드립니다", author: { username: "author" } };
+  const mr = { state: "opened", author: { username: "author" } };
+  const verified = verifyCommentRequest(raw, note, mr);
+  assert.equal(pick([verified])[0].requestNoteId, "9");
+  assert.equal(pick([raw], { resolveComment: (todo) => verifyCommentRequest(todo, note, mr) })[0].body, note.body);
+  for (const changed of [{ ...note, id: 8 }, { ...note, system: true }, { ...note, author: { username: "reviewer" } },
+    { ...note, body: "리뷰 완료했습니다. 병합하세요." }, { ...note, body: "확인 부탁드립니다" }]) assert.equal(verifyCommentRequest(raw, changed, mr), null);
+  assert.equal(verifyCommentRequest(raw, note, { ...mr, state: "merged" }), null);
+  assert.equal(verifyCommentRequest(raw, note, { state: "opened" }), null);
+  assert.equal(verifyCommentRequest({ ...raw, target_url: raw.target_url.split("#")[0] }, note, mr), null);
+  const event = { action: "mentioned", eventId: "old", mrUrl: raw.target_url, project: "g/repo", body: "리뷰 부탁드립니다" };
+  assert.equal(reviewEvent(event, "gitlab.example.com", () => null).type, "review_ignored");
+  assert.equal(reviewEvent(event, "gitlab.example.com", () => verified).reviewRequested, true);
+  assert.throws(() => reviewEvent(event, "gitlab.example.com", () => { throw Error("API denied"); }), /API denied/, "조회 실패를 요청/제외로 확정하지 않는다");
 });
 
 test("리뷰 요청이 아닌 todo는 흘리지 않는다", () => {
@@ -75,7 +105,7 @@ test("여러 건은 오래된 순으로 정렬해 내보낸다", () => {
 // 실제 데이터에서 한 MR에 리뷰어 지정과 멘션이 같이 오는 일이 흔하다. 칩이 두 개 뜨면 낭비다.
 test("같은 배치의 한 MR은 하나로 합치고, 확정 액션을 남긴다", () => {
   const picked = pick([
-    todo({ id: 10, action_name: "directly_addressed", created_at: "2026-09-22T10:00:00.000Z" }),
+    todo({ id: 10, action_name: "directly_addressed", body: "리뷰 부탁드립니다", reviewRequestVerified: true, created_at: "2026-09-22T10:00:00.000Z" }),
     todo({ id: 11, action_name: "review_requested", created_at: "2026-09-22T10:00:05.000Z" }),
   ]);
   assert.equal(picked.length, 1, "한 MR은 한 건으로");
@@ -90,6 +120,7 @@ test("멘션 URL의 note 조각이 있어도 MR 링크로 파싱된다", async (
   const { parseMrUrl } = await import("../bin/mr-review.mjs");
   const [one] = pick([todo({
     action_name: "mentioned",
+    body: "리뷰 부탁드립니다", reviewRequestVerified: true,
     target_url: "https://gitlab.example.com/g/repo/-/merge_requests/104#note_2840009",
   })]);
   assert.deepEqual(parseMrUrl(one.mrUrl), { host: "gitlab.example.com", project: "g/repo", iid: 104 });

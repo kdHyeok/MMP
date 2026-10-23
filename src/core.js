@@ -1,7 +1,8 @@
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { resolveDataDir } from "./paths.js";
+export { resolveDataDir } from "./paths.js";
 
 const NAME_PATTERN = /^[\p{L}\p{N}](?:[\p{L}\p{N} ._-]*[\p{L}\p{N}._-])?$/u;
 const USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9_-])?$/;
@@ -30,16 +31,6 @@ function requireUsername(value, label) {
   if (!USERNAME_PATTERN.test(value)) {
     throw new UserError(`${label} must omit @ and contain only letters, numbers, dot, underscore, or hyphen (max 64).`);
   }
-}
-
-export function resolveDataDir(explicitPath) {
-  if (explicitPath) return explicitPath;
-  if (process.env.MATTERMOST_MCP_DATA_DIR) return process.env.MATTERMOST_MCP_DATA_DIR;
-  const forwardedUserProfile = process.env.MATTERMOST_MCP_USERPROFILE;
-  const base = forwardedUserProfile && forwardedUserProfile !== "__MMP_UNSET__"
-    ? forwardedUserProfile
-    : homedir();
-  return join(base, ".mmp");
 }
 
 function resolveLegacyDataDir() {

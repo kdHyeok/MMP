@@ -1,4 +1,6 @@
 node_modules/
+.mmp-worktrees/
+/docs/codex-live-validation.md
 .npm-cache/
 .uv-cache/
 .data/

@@ -3,21 +3,11 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/bin/mr-review.mjs", "gate"],
-            "if": "Bash(glab *)",
-            "timeout": 10,
-            "statusMessage": "MR 리뷰 가드레일 확인 중"
-          },
-          {
-            "type": "command",
-            "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/bin/mr-review.mjs", "gate"],
-            "if": "Bash(node *)",
+            "command": "node -e \"const root=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!root){process.stderr.write('MMP plugin root is missing');process.exit(2)}process.argv=[process.execPath,require('node:path').join(root,'bin/mr-review.mjs'),'gate'];import(require('node:url').pathToFileURL(process.argv[1]).href).catch(()=>process.exit(2))\"",
             "timeout": 10,
             "statusMessage": "MR 리뷰 단계 확인 중"
           }

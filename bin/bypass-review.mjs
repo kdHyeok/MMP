@@ -4,8 +4,9 @@
 // "감시가 도느냐"는 여기서 다루지 않는다. 그건 감시 세션이 열려 있느냐로 결정되고,
 // 파일은 그 사실을 알 수 없다. 파일은 지킬 수 있는 약속만 한다 — "돌 때 승인을 받느냐".
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { resolveDataDir } from "../src/paths.js";
 
 // 초기값일 뿐이다. `channel <이름>` 으로 바꾼다. 다른 곳 어디에도 이 문자열은 없다.
 const INITIAL_CHANNEL = "특화-팀-BND";
@@ -13,7 +14,7 @@ const INITIAL_CHANNEL = "특화-팀-BND";
 export class BypassError extends Error {}
 
 export function dataDir() {
-  return process.env.MATTERMOST_MCP_DATA_DIR ?? join(homedir(), ".mmp");
+  return resolveDataDir();
 }
 
 export function stateFile(dir = dataDir()) {
@@ -74,7 +75,7 @@ function main(argv) {
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].replaceAll("\\", "/")}`).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     process.stdout.write(`${JSON.stringify(main(process.argv.slice(2)), null, 2)}\n`);
   } catch (error) {

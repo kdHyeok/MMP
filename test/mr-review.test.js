@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { HOLD_CATEGORIES, citedLocations, collectAuthorNotes, gateDecision, missingSections, mmQuestions, parseMrUrl, sessionTitleFor, syncMrWorktree, usedHoldCategories, verdictProblems } from "../bin/mr-review.mjs";
+import { HOLD_CATEGORIES, citedLocations, collectAuthorNotes, gateCwd, gateDecision, missingSections, mmQuestions, parseMrUrl, sessionTitleFor, syncMrWorktree, usedHoldCategories, verdictProblems } from "../bin/mr-review.mjs";
 
 const bash = (command) => ({ tool_name: "Bash", tool_input: { command } });
 const at = (step, extra = {}) => () => ({ step, iid: 71, project: "group/repo", verdict: "hold", body: "본문", ...extra });
@@ -81,7 +81,7 @@ docs/README.md`;
   assert.deepEqual(usedHoldCategories(many), ["[안전]", "[데이터]"]);
 
   // 카테고리 목록 자체가 흔들리면 스킬 문서와 어긋난다
-  assert.deepEqual(HOLD_CATEGORIES, ["[정확성]", "[안전]", "[데이터]", "[계약]", "[구현]"]);
+  assert.deepEqual(HOLD_CATEGORIES, ["[정확성]", "[안전]", "[데이터]", "[계약]", "[구현]", "[문서내용]"]);
 });
 
 // 위치를 못 대는 보류는 확인이 아니라 추측이다.
@@ -164,7 +164,7 @@ test("게이트는 순서를 강제한다", () => {
 test("사용자 승인 없이 게시하려 하면 확정적으로 deny한다", () => {
   const withoutConfirm = gateDecision(bash("node bin/mr-review.mjs post"), at("reviewed"), () => "on");
   assert.equal(withoutConfirm.permissionDecision, "deny");
-  assert.match(withoutConfirm.permissionDecisionReason, /AskUserQuestion/);
+  assert.match(withoutConfirm.permissionDecisionReason, /사용자에게 게시 승인/);
 });
 
 // bypass 동안은 사용자가 "전부 무승인"을 명시적으로 켠 상태다. 게이트가 막지 않는다.
@@ -279,6 +279,10 @@ test("MR의 원격 브랜치를 워크트리로 가져오고 현재 작업 트�
     assert.equal(git(clone, "rev-parse", "HEAD"), cloneHeadBefore, "현재 작업 트리의 HEAD는 그대로여야 한다");
     assert.equal(git(clone, "rev-parse", "--abbrev-ref", "HEAD"), "main", "현재 작업 트리의 브랜치도 그대로여야 한다");
 
+    writeFileSync(join(first.path, "local.txt"), "사용자 변경");
+    assert.throws(() => syncMrWorktree({ cwd: clone, remote: "origin", iid: 172, sourceBranch: "feat/login", worktreeRoot }), /커밋되지 않은 변경/);
+    rmSync(join(first.path, "local.txt"));
+
     // 저자가 MR에 커밋을 더 밀면 ff-only로 따라간다.
     writeFileSync(join(author, "a.txt"), "mr work v2\n");
     git(author, "commit", "-am", "more");
@@ -310,6 +314,11 @@ test("MR의 원격 브랜치를 워크트리로 가져오고 현재 작업 트�
     );
     assert.equal(git(task, "rev-parse", "--abbrev-ref", "HEAD"), "claude/other-task", "실패해도 브랜치는 그대로");
 
+    const managed = syncMrWorktree({ cwd: task, remote: "origin", iid: 172, sourceBranch: "feat/login", worktreeRoot, here: true, keepBranch: true });
+    assert.equal(managed.reusedInPlace, true);
+    assert.equal(git(task, "rev-parse", "--abbrev-ref", "HEAD"), "claude/other-task", "관리 브랜치 이름을 유지한다");
+    assert.equal(git(task, "rev-parse", "HEAD"), git(first.path, "rev-parse", "HEAD"));
+
     // 충돌이 없으면 --here 가 그 자리를 그대로 쓴다.
     git(clone, "worktree", "remove", "--force", first.path);
     const forced = syncMrWorktree({ cwd: task, remote: "origin", iid: 172, sourceBranch: "feat/login", worktreeRoot, here: true });
@@ -335,7 +344,7 @@ test("확인하지 못한 지적 수가 제목에 드러나야 한다", () => {
 });
 
 test("확인된 [높음] 지적이 있으면 승인할 수 없다", () => {
-  const approve = (item) => `## 리뷰 결과: 승인${item.includes("[확인 필요]") ? " (미확인 1건)" : ""}\n요약\n### 고치면 좋을 것\n${item}\n### 확인한 범위\n- 전부`;
+  const approve = (item) => `## 리뷰 결과: 승인${item.includes("[확인 필요]") ? " (미확인 1건)" : ""}\n요약\n### 고치면 좋을 것\n${item}\n### 병합 안내\n위 항목을 수정한 뒤 직접 병합해 주세요.\n### 확인한 범위\n- 전부`;
   assert.match(verdictProblems("approve", approve("1. [높음] [정확성] `a.py:3` — 빈 배열에서 터짐")).join(), /승인할 수 없습니다/);
   assert.deepEqual(verdictProblems("approve", approve("1. [높음] [확인 필요] `a.py:3` — 동시 호출 시 중복 삽입 가능성")), [],
     "확인하지 못한 [높음]은 막지 않고 제목에만 드러낸다");
@@ -351,6 +360,7 @@ test("보류는 확인된 사유가 하나는 있어야 한다", () => {
   ].join("\n");
 
   assert.deepEqual(verdictProblems("hold", hold(["1. [높음] [정확성] `a.py:3` — 빈 배열에서 터짐"])), []);
+  assert.deepEqual(verdictProblems("hold", hold(["1. [중간] [문서내용] `docs/plan.md:3` — 핵심 일정이 합의된 일정과 다름"])), []);
   assert.match(verdictProblems("hold", hold(["1. [높음] [정확성] [확인 필요] `a.py:3` — 아마 터짐"], 1)).join(), /확인된 보류 사유가 없습니다/,
     "추측만으로는 막지 않는다");
   assert.match(verdictProblems("hold", hold(["1. [높음] [정확성] — 위치 없이 터진다고만"])).join(), /확인된 보류 사유가 없습니다/,
