@@ -3,7 +3,7 @@
 공통 SKILL.md의 리뷰 기준과 하네스를 그대로 사용한다. 이 문서는 실행 수단만 정한다.
 
 - `<PLUGIN_ROOT>`는 설치된 플러그인의 절대경로다. Claude의 `CLAUDE_PLUGIN_ROOT` 또는 현재 스킬 위치로 확인한다.
-- 사용자에게 게시 전문과 작성자 DM 대상·논리 채널을 보여주고 `AskUserQuestion`으로 확인한다. 응답을 받은 뒤 `post --confirmed`를 실행한다. bypass가 켜져 있으면 공통 정책대로 진행한다.
+- 사용자에게 게시 전문과 리뷰 요청자 DM 대상·논리 채널을 보여주고 `AskUserQuestion`으로 확인한다. 응답을 받은 뒤 `post --confirmed`를 실행한다. bypass가 켜져 있으면 공통 정책대로 진행한다. 요청자 GitLab ID를 확인해 prepare --requester로 전달하고 과거 본인 전송 제한은 최신 사용자 지시와 공통 확인 규칙에 따라 처리한다.
 - 제목은 `get_session({session_id:"self"})`로 기억하고 `set_session_title`로 변경/복원한다. 이 도구가 없으면 MR 번호와 작업 경로를 대화에 표시한다.
 - `prepare` 출력 `reusedInPlace`가 false면 `EnterWorktree({path:worktreePath})`로 들어간다. 실패하면 반환된 절대경로와 하네스의 `--cwd`를 사용하고 이동 실패를 알린다.
 - 인라인 리뷰가 끝나면 `ExitWorktree({action:"keep"})`로 나온다. 워크트리는 자동 삭제하지 않는다.

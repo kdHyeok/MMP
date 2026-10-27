@@ -15,6 +15,13 @@ const cli = (file, args, env, input) => execFileSync(process.execPath, [join(roo
   { encoding: "utf8", env: { ...process.env, ...env }, input, stdio: ["pipe", "pipe", "pipe"] });
 const json = (text) => JSON.parse(text);
 
+test("Codex 재리뷰 예제는 요청자 DM이 기본이며 self-only를 강제하지 않는다", () => {
+  const guide = readFileSync(join(root, "skills", "references", "codex.md"), "utf8");
+  assert.ok(guide.includes("--requester <확인한GitLabID>"));
+  assert.ok(guide.includes("최신 사용자 지시"));
+  assert.ok(!guide.includes("--event-id <새eventId> --self-only"));
+});
+
 test("MCP와 승인 정책은 전달된 사용자 프로필과 명시적 데이터 경로를 공유한다", () => {
   const before = { profile: process.env.MATTERMOST_MCP_USERPROFILE, dir: process.env.MATTERMOST_MCP_DATA_DIR };
   try {

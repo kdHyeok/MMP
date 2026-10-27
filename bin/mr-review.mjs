@@ -391,7 +391,15 @@ export function syncMrWorktree({ cwd, remote, iid, sourceBranch, worktreeRoot, h
   return { path, branch, targetRef, forked, createdWorktree: !registered, reusedInPlace: false };
 }
 
+function requesterFlag(flags) {
+  if (flags.requester === undefined) return null;
+  if (typeof flags.requester !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(flags.requester)) fail("--requester에는 확인한 GitLab 사용자명을 @ 없이 지정하세요.");
+  if (flags["self-only"] === true) fail("--requester와 --self-only를 함께 지정할 수 없습니다.");
+  return flags.requester;
+}
+
 async function cmdPrepare(rawUrl, flags = {}) {
+  const requester = requesterFlag(flags);
   if (!rawUrl) fail("사용법: mr-review.mjs prepare <MR 링크> [--worktree-root <경로>] [--here]");
   const { host, project, iid } = parseMrUrl(rawUrl);
   assertGlabAuth(host);
@@ -439,7 +447,8 @@ async function cmdPrepare(rawUrl, flags = {}) {
     fail("--rereview는 같은 MR의 완료된 리뷰 워크트리에서 --here와 새 --event-id로만 시작하세요.");
   }
   if (sameMr && !flags.rereview) fail("같은 MR의 새 리뷰는 기존 워크트리에서 --rereview --here로 시작하세요. 이전 기록은 보존됩니다.");
-  const selfOnly = flags["self-only"] === true || (flags.rereview === true && previous.notificationSelfOnly === true);
+  if (requester && previous?.notificationSelfOnly && flags.confirmed !== true) fail("기존 본인 전송 제한을 요청자로 변경하려면 사용자 확인 후 --confirmed를 지정하세요.");
+  const selfOnly = flags["self-only"] === true || (flags.rereview === true && previous.notificationSelfOnly === true && !requester);
   const worktree = syncMrWorktree({
     cwd, remote, iid, sourceBranch: mr.source_branch, worktreeRoot, here: flags.here === true,
     keepBranch: flags["keep-branch"] === true,
@@ -476,6 +485,9 @@ async function cmdPrepare(rawUrl, flags = {}) {
         const self = service.listParticipants({ selfOnly: true });
         if (self.length !== 1) fail("본인 전송 제한: isSelf 참여자가 정확히 한 명이어야 합니다.");
         notificationRecipient = { id: self[0].id, mention: self[0].mention };
+      } else if (requester) {
+        const matches = service.listParticipants({ gitlabUsername: requester });
+        if (matches.length === 1) notificationRecipient = { id: matches[0].id, mention: matches[0].mention };
       }
       hasConvention = service.listConventions({ name: "review-complete" }).length > 0;
     } finally {
@@ -484,7 +496,8 @@ async function cmdPrepare(rawUrl, flags = {}) {
   } catch (error) {
     storageError = error.message;
   }
-  const postQuestions = mmQuestions({ authorGitlab, mention: notificationRecipient?.mention ?? mention, channels, hasConvention, storageError });
+  const postQuestions = mmQuestions({ authorGitlab: requester ?? authorGitlab,
+    mention: requester ? notificationRecipient?.mention : notificationRecipient?.mention ?? mention, channels, hasConvention, storageError });
 
   const state = writeState({
     version: 1,
@@ -503,6 +516,7 @@ async function cmdPrepare(rawUrl, flags = {}) {
     worktreePath: worktree.path,
     preparedSha: run("git", ["rev-parse", "HEAD"], { cwd: worktree.path }),
     notificationSelfOnly: selfOnly,
+    notificationRequester: requester,
     ...(flags.rereview ? { history: [...(previous.history ?? []), Object.fromEntries(Object.entries(previous).filter(([key]) => key !== "history"))] } : {}),
     step: "prepared",
     verdict: null,
@@ -615,8 +629,11 @@ async function cmdNotify(flags) {
   const cwd = process.cwd();
   const state = readState(cwd);
   requireStep(state, "posted", "`post`로 MR 답글을 먼저 게시하세요.");
+  const requester = requesterFlag(flags) ?? state.notificationRequester;
+  if (flags.requester && (state.notificationSelfOnly || (state.notificationRequester && requester !== state.notificationRequester))
+    && flags.confirmed !== true) fail("저장된 DM 수신 정책 변경은 사용자 확인 후 --confirmed가 필요합니다.");
 
-  // 팀 채널이 아니라 MR 작성자에게 DM으로 보낸다. --channel 은 목적지가 아니라 웹훅 자격증명 출처다.
+  // 요청자 우선 DM이다. --channel은 목적지가 아니라 웹훅 자격증명 출처다.
   // bypass 동안은 채널을 묻지 않는다. 설정된 기본 채널을 쓴다.
   const fallbackChannel = autoMode() === "bypass" ? defaultChannel(readAutoState()) : null;
   const viaChannel = flags.channel ?? fallbackChannel ?? fail("--channel <논리채널명> 이 필요합니다(DM에 쓸 웹훅 출처).");
@@ -624,11 +641,16 @@ async function cmdNotify(flags) {
 
   const service = await mattermostService();
   try {
-    const selfOnly = state.notificationSelfOnly || flags["self-only"] === true;
+    const selfOnly = (state.notificationSelfOnly && !flags.requester) || flags["self-only"] === true;
+    if (selfOnly && requester) fail("요청자 DM과 본인 전송 제한이 충돌합니다. 수신 정책을 확인하세요.");
     const self = selfOnly ? service.listParticipants({ selfOnly: true }) : [];
     if (selfOnly && self.length !== 1) fail("본인 전송 제한: isSelf 참여자가 정확히 한 명이어야 합니다.");
-    const participantId = Number(selfOnly ? self[0].id : flags["participant-id"] ?? state.authorParticipantId);
-    const mention = selfOnly ? self[0].mention : flags.mention ?? state.authorMention;
+    const matches = requester ? service.listParticipants({ gitlabUsername: requester }) : [];
+    if (requester && matches.length !== 1) fail("리뷰 요청자의 정확한 Mattermost 매핑이 필요합니다. 본인이나 작성자로 대체하지 않습니다.");
+    const participantId = Number(selfOnly ? self[0].id : requester ? matches[0].id : flags["participant-id"] ?? state.authorParticipantId);
+    const mention = selfOnly ? self[0].mention : requester ? matches[0].mention : flags.mention ?? state.authorMention;
+    if (requester && ((flags["participant-id"] && Number(flags["participant-id"]) !== participantId)
+      || (flags.mention && flags.mention !== mention))) fail("리뷰 요청자와 다른 수신자로 변경할 수 없습니다.");
     if (selfOnly && ((flags["participant-id"] && Number(flags["participant-id"]) !== participantId)
       || (flags.mention && flags.mention !== mention))) fail("본인 전송 제한: 다른 수신자로 변경할 수 없습니다.");
     if (!Number.isInteger(participantId) || participantId <= 0 || !mention) fail("DM 수신자를 특정하지 못했습니다. 참여자 매핑을 확인하세요.");
@@ -647,7 +669,8 @@ async function cmdNotify(flags) {
         message: flags.message ?? "리뷰 완료 했습니다.",
       },
     });
-    writeState({ ...state, step: "notified", notifiedAt: new Date().toISOString() }, cwd);
+    writeState({ ...state, notificationSelfOnly: Boolean(selfOnly), notificationRequester: requester ?? null,
+      step: "notified", notifiedAt: new Date().toISOString() }, cwd);
     return sent;
   } finally {
     service.close();

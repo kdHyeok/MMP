@@ -134,6 +134,8 @@ prepared → reviewed → posted → (조건부 auto-approve) → notified
 
 본인 DM 제한은 `prepare --self-only`로 리뷰 상태에 저장하고 `notify`가 등록된 `isSelf` 수신자 한 명만 선택합니다. 명시적 다른 수신자 옵션도 거부하며, 일반적인 작성자 DM 흐름은 그대로 유지합니다.
 
+리뷰 완료의 기본 수신 정책은 요청자 우선입니다. 검증된 GitLab 요청자의 ID를 `prepare --requester <ID>`로 지정하면 notificationRequester로 저장하고 notify가 정확한 매핑을 재조회합니다. 매핑 누락/중복은 본인·작성자로 대체하지 않으며 다른 participant-id/mention 지정도 거부합니다. 별도 요청자가 전혀 없는 기존 리뷰만 MR 작성자 기본 경로를 씁니다. 과거 self-only를 해제하라는 최신 사용자 지시를 확인한 경우에만 `prepare --requester <ID> --confirmed` 또는 posted 회차의 `notify --requester <ID> --confirmed`로 변경합니다. 완료된 notified DM은 재전송하지 않습니다.
+
 ### Codex 독립 리뷰 채팅과 병합 후 보관
 
 사용자가 독립 채팅 생성을 승인한 감시에서는 **MR 최초 요청에만** `create_thread`의 프로젝트 워크트리 환경으로 새 채팅을 만듭니다. 감시기는 앱 API를 직접 호출하지 않으며 스킬/heartbeat가 조율합니다. `--session-claim <eventId>`를 생성 전 저장하고 생성 후 `--session-bind <eventId> --thread-id <실제ID> --worktree-path <절대경로>`를 저장합니다. 같은 호스트·프로젝트·MR의 새 요청이면 기존 레코드의 `eventIds`에 연결하고 `reused=true`를 반환하므로 새 채팅·워크트리를 만들지 않습니다. 기존의 eventId 전용 레코드도 호환됩니다. 기존 중복은 삭제하지 않고 새 이벤트를 최초 연결 채팅에 모으며, 이미 연결된 다른 이벤트의 채팅은 재연결하지 않습니다. 대기 생성의 clientThreadId는 별도 필드로 저장합니다. 결과가 불명확해도 claim을 지우고 재생성하지 않습니다. 기존 채팅을 조회해 연결하거나 사용자 조치를 요청합니다.
