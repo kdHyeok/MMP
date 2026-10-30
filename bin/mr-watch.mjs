@@ -12,7 +12,7 @@ import { resolveDataDir } from "../src/paths.js";
 
 const POLL_MS = 60_000;
 
-// 리뷰 요청이 확실한 것. 판정 없이 바로 리뷰 세션을 띄워도 된다.
+// 리뷰 요청 액션. 최신 로그인 계정이 현재 리뷰어인지도 반드시 검증한다.
 export const REVIEW_ACTIONS = new Set(["review_requested", "approval_required"]);
 // MR에서 나를 부른 것. 리뷰 요청인지 단순 질문인지는 body를 보고 판단해야 한다.
 export const MAYBE_ACTIONS = new Set(["directly_addressed", "mentioned"]);
@@ -21,32 +21,69 @@ export const MAYBE_ACTIONS = new Set(["directly_addressed", "mentioned"]);
 export class WatchError extends Error {}
 
 // shortcut: 명시적인 한/영 요청만 자동 처리한다. 다른 표현은 사용자가 직접 리뷰를 시작한다.
-export function isExplicitReviewRequest(body) {
-  const text = String(body ?? "").replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, "")
+function requestText(body) {
+  return String(body ?? "").replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, "")
     .replace(/^\s*>.*$/gm, "").replace(/`[^`\n]*`|"[^"\n]*"|“[^”\n]*”/g, "");
+}
+
+export function isExplicitReviewRequest(body) {
+  const text = requestText(body);
   if (/^\s*(?:#{1,6}\s*)?리뷰\s*(?:결과|완료)/m.test(text)
     || /리뷰[^\n.!?]{0,30}(?:아닙|하지\s*마|불필요|필요\s*없)|(?:do\s+not|don'?t|no\s+need\s+to)\s+(?:re[- ]?)?review/i.test(text)) return false;
   return /(?:재\s*)?리뷰(?:를|도)?\s*(?:다시\s*)?(?:좀\s*)?(?:요청\s*(?:드립니다|합니다|드려요|해요)|부탁\s*(?:드립니다|합니다|드려요|해요)|해\s*(?:주세요|줘|주실|주시겠|줄))|(?:please|could\s+you|can\s+you|would\s+you)\s+(?:re[- ]?)?review\b|\brequesting\s+(?:a\s+|another\s+)?review\b/i.test(text);
 }
 
-export function verifyCommentRequest(todo, note, mr) {
-  const id = String(todo.target_url ?? "").match(/#note_(\d+)$/)?.[1];
-  if (!id || String(note?.id) !== id || note.system !== false || mr?.state !== "opened"
-    || !mr.author?.username || note.author?.username !== mr.author.username || !isExplicitReviewRequest(note.body)) return null;
-  return { ...todo, body: note.body, author: note.author, reviewRequestVerified: true, requestNoteId: id };
+// Old todos remain pending after reviewer reassignment. Never trust their action alone.
+export function reviewTargetProblem(mr, user) {
+  if (!Number.isInteger(user?.id) || user.id <= 0 || typeof user.username !== "string" || !user.username)
+    throw new WatchError("현재 로그인 계정을 확인하지 못했습니다.");
+  if (!["opened", "closed", "merged", "locked"].includes(mr?.state)
+    || !Array.isArray(mr.reviewers)
+    || mr.reviewers.some((reviewer) => !Number.isInteger(reviewer?.id) || typeof reviewer.username !== "string"))
+    throw new WatchError("최신 MR 상태·리뷰어 목록을 확인하지 못했습니다.");
+  if (mr.state !== "opened") return "열린 MR의 리뷰 요청이 아닙니다.";
+  if (!mr.reviewers.some((reviewer) => reviewer.id === user.id && reviewer.username === user.username))
+    return "현재 로그인 계정이 최신 MR 리뷰어가 아닙니다. 리뷰어가 바뀌었거나 해제된 요청은 제외합니다.";
+  return null;
 }
 
-function fetchCommentRequest(todo, host) {
-  const url = new URL(todo.target_url);
-  const match = url.pathname.match(/^\/(.+)\/-\/merge_requests\/(\d+)\/?$/);
-  const noteId = url.hash.match(/^#note_(\d+)$/)?.[1];
-  if (!match || url.host !== host || match[1] !== todo.project?.path_with_namespace || !noteId) return null;
-  const endpoint = `projects/${encodeURIComponent(match[1])}/merge_requests/${match[2]}`;
-  const get = (path) => JSON.parse(execFileSync("glab", ["api", path, "--hostname", host], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
-  const mr = get(endpoint);
-  const note = get(`${endpoint}/notes/${noteId}`);
-  if (!mr?.state || !note?.id || mr.message || note.message) throw new WatchError("리뷰 요청의 실제 MR·댓글을 확인하지 못했습니다.");
-  return verifyCommentRequest(todo, note, mr);
+export function verifyCommentRequest(todo, note, mr, user) {
+  if (reviewTargetProblem(mr, user)) return null;
+  const id = String(todo.target_url ?? "").match(/#note_(\d+)$/)?.[1];
+  const mentions = [...requestText(note?.body).matchAll(/(^|[^\w@])@([A-Za-z0-9_][A-Za-z0-9_.-]*)/g)].map((match) => match[2]);
+  if (!id || String(note?.id) !== id || note.system !== false
+    || !mr.author?.username || note.author?.username !== mr.author.username
+    || !mentions.includes(user.username) || !isExplicitReviewRequest(note.body)) return null;
+  return { ...todo, body: note.body, author: note.author, reviewRequestVerified: true,
+    reviewTargetVerified: true, reviewerUsername: user.username, requestNoteId: id };
+}
+
+function gitlabGet(path, host) {
+  return JSON.parse(execFileSync("glab", ["api", path, "--hostname", host],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
+}
+
+export function fetchReviewRequest(todo, host, get = gitlabGet) {
+  try {
+    const url = new URL(todo.target_url);
+    const match = url.pathname.match(/^\/(.+)\/-\/merge_requests\/(\d+)\/?$/);
+    if (!match || !["https:", "http:"].includes(url.protocol) || url.host !== host
+      || match[1] !== todo.project?.path_with_namespace) return null;
+    const endpoint = `projects/${encodeURIComponent(match[1])}/merge_requests/${match[2]}`;
+    const user = get("user", host);
+    const mr = get(endpoint, host);
+    if (reviewTargetProblem(mr, user)) return null;
+    if (REVIEW_ACTIONS.has(todo.action_name))
+      return { ...todo, reviewTargetVerified: true, reviewerUsername: user.username };
+    const noteId = url.hash.match(/^#note_(\d+)$/)?.[1];
+    if (!MAYBE_ACTIONS.has(todo.action_name) || !noteId) return null;
+    const note = get(`${endpoint}/notes/${noteId}`, host);
+    if (!note?.id || note.message) throw new WatchError("리뷰 요청의 실제 댓글을 확인하지 못했습니다.");
+    return verifyCommentRequest(todo, note, mr, user);
+  } catch (error) {
+    if (error instanceof WatchError) throw error;
+    throw new WatchError("GitLab의 로그인 계정·최신 리뷰어·요청 댓글 조회에 실패했습니다. 자동 리뷰를 시작하지 않습니다.");
+  }
 }
 
 function readJson(path, fallback) {
@@ -102,7 +139,7 @@ export function loadConfig(path, hosts = detectHosts) {
 }
 
 // 어떤 todo를 리뷰 작업으로 흘려보낼지 고른다. 멘션은 실제 댓글 조회 결과를 주입한다.
-export function selectTodos(todos, { projects, seen, since, resolveComment }) {
+export function selectTodos(todos, { projects, seen, since, resolveRequest }) {
   const picked = [];
   for (let todo of Array.isArray(todos) ? todos : []) {
     if (todo?.target_type !== "MergeRequest") continue;
@@ -115,15 +152,16 @@ export function selectTodos(todos, { projects, seen, since, resolveComment }) {
     if (seen.has(todo.id)) continue;
     // 감시 시작 이전에 쌓여 있던 todo는 재생하지 않는다. 부팅 때 수십 건이 쏟아지는 게 놓치는 것보다 나쁘다.
     if (since && !(Date.parse(todo.created_at) > since)) continue;
-    if (!certain) {
-      todo = resolveComment ? resolveComment(todo) : todo;
-      if (!todo?.reviewRequestVerified || !isExplicitReviewRequest(todo.body)) continue;
-    }
+    todo = resolveRequest ? resolveRequest(todo) : todo;
+    if (todo?.reviewTargetVerified !== true) continue;
+    if (!certain && (!todo.reviewRequestVerified || !isExplicitReviewRequest(todo.body))) continue;
 
     picked.push({
       todoId: todo.id,
       action,
       certain,
+      reviewTargetVerified: true,
+      reviewerUsername: todo.reviewerUsername ?? null,
       project,
       iid: todo.target?.iid ?? null,
       mrUrl: todo.target_url,
@@ -232,12 +270,12 @@ export function watchActive(state, now = Date.now()) {
   return Boolean(state && !state.stopped && (!state.expiresAt || now < state.expiresAt));
 }
 
-export function enqueueTodos(state, todos, projects, resolveComment) {
+export function enqueueTodos(state, todos, projects, resolveRequest) {
   const queue = state.queue ?? [];
   // pending에 남은 제외/처리 이벤트는 수에 상관없이 기억한다. GitLab에서 사라진 것만 정리한다.
   const pendingIds = new Set(todos.map((todo) => todo.id));
   const seen = new Set([...state.seen.filter((id) => pendingIds.has(id)), ...queue.flatMap((item) => item.todoIds)]);
-  const picked = selectTodos(todos, { projects, seen, since: state.since, resolveComment });
+  const picked = selectTodos(todos, { projects, seen, since: state.since, resolveRequest });
   for (const item of picked) for (const id of item.todoIds) seen.add(id);
   return { ...state, seen: [...seen],
     queue: [...queue, ...picked.map((item) => ({ ...item, eventId: String(item.todoId) }))] };
@@ -308,15 +346,17 @@ export function markSessionArchived(state, id, fetch = fetchSessionMr) {
   return { ...state, sessions: state.sessions.map((item) => item !== session ? item : { ...item, archivedAt: new Date().toISOString() }) };
 }
 
-export function reviewEvent(item, host, fetch = fetchCommentRequest) {
-  if (REVIEW_ACTIONS.has(item.action)) return { ...item, reviewRequested: true };
-  const todo = MAYBE_ACTIONS.has(item.action) ? fetch({ target_url: item.mrUrl,
-    project: { path_with_namespace: item.project } }, host) : null;
-  return { ...item, body: todo?.body ?? item.body, reviewRequested: Boolean(todo?.reviewRequestVerified),
-    ...(todo ? { requestNoteId: todo.requestNoteId } : { type: "review_ignored", reason: "MR 작성자의 명시적 리뷰 요청 댓글이 아닙니다." }) };
+export function reviewEvent(item, host, fetch = fetchReviewRequest) {
+  const todo = REVIEW_ACTIONS.has(item.action) || MAYBE_ACTIONS.has(item.action)
+    ? fetch({ action_name: item.action, target_url: item.mrUrl, project: { path_with_namespace: item.project } }, host) : null;
+  const requested = todo?.reviewTargetVerified === true
+    && (REVIEW_ACTIONS.has(item.action) || todo.reviewRequestVerified === true);
+  return { ...item, body: todo?.body ?? item.body, reviewTargetVerified: requested, reviewRequested: requested,
+    ...(requested ? { reviewerUsername: todo.reviewerUsername ?? null, requestNoteId: todo.requestNoteId ?? null }
+      : { type: "review_ignored", reason: "현재 로그인 계정 대상의 유효한 MR 리뷰 요청이 아닙니다. 최신 리뷰어와 댓글 멘션을 확인하세요." }) };
 }
 
-export function tick(paths, client, fetch = fetchTodos, resolveComment = fetchCommentRequest) {
+export function tick(paths, client, fetch = fetchTodos, resolveRequest = fetchReviewRequest) {
   const before = readWatchState(paths.state);
   if (before?.client && before.client !== client) throw new WatchError(`감시는 ${before.client}에서 시작했습니다. 먼저 중지하고 ${client}에서 다시 시작하세요.`);
   if (before && !watchActive(before)) return { state: before, picked: 0, pending: 0 };
@@ -327,7 +367,7 @@ export function tick(paths, client, fetch = fetchTodos, resolveComment = fetchCo
     const previous = { since: Date.now(), seen: [], queue: [], ...old, client: old?.client ?? client };
     if (previous.client && previous.client !== client) throw new WatchError(`감시는 ${previous.client}에서 시작했습니다. 먼저 중지하고 ${client}에서 다시 시작하세요.`);
     if (!watchActive(previous)) return previous;
-    const next = enqueueTodos(previous, todos, projects, (todo) => resolveComment(todo, host));
+    const next = enqueueTodos(previous, todos, projects, (todo) => resolveRequest(todo, host));
     picked = next.queue.length - (previous.queue?.length ?? 0);
     return next;
   });
@@ -339,7 +379,7 @@ export function tick(paths, client, fetch = fetchTodos, resolveComment = fetchCo
 // 상태를 건드리지 않으므로, 여기서 본 것이 나중에 이벤트로 또 오지는 않는다(since가 그것을 막는다).
 function listPending(paths) {
   const { host, projects } = loadConfig(paths.config);
-  return selectTodos(fetchTodos(host), { projects, seen: new Set(), since: 0, resolveComment: (todo) => fetchCommentRequest(todo, host) })
+  return selectTodos(fetchTodos(host), { projects, seen: new Set(), since: 0, resolveRequest: (todo) => fetchReviewRequest(todo, host) })
     .map(({ iid, project, mrUrl, title, authorName, action, certain, createdAt, requestNoteId }) =>
       ({ iid, project, mrUrl, title, authorName, action, certain, createdAt, requestNoteId, reviewRequested: true }));
 }
@@ -365,7 +405,7 @@ async function main(argv) {
   }
   if (argv.includes("--queue")) {
     const items = readWatchState(paths.state)?.queue ?? [];
-    const host = items.some((item) => MAYBE_ACTIONS.has(item.action)) ? loadConfig(paths.config).host : null;
+    const host = items.length > 0 ? loadConfig(paths.config).host : null;
     for (const item of items) emit({ ...reviewEvent(item, host), mode: effectiveMode(readBypassState()) });
     return;
   }
@@ -382,9 +422,17 @@ async function main(argv) {
     const id = value(action);
     if (!id || id.startsWith("--")) throw new WatchError(`${action}에는 eventId가 필요합니다.`);
     const optional = (flag) => argv.includes(flag) ? value(flag) : undefined;
-    const state = withState(paths, (old) => action === "--session-claim" ? claimSession(old, id)
-      : action === "--session-archived" ? markSessionArchived(old, id)
-        : bindSession(old, id, { threadId: optional("--thread-id"), clientThreadId: optional("--client-thread-id"), hostId: optional("--host-id"), worktreePath: optional("--worktree-path") }));
+    const state = withState(paths, (old) => {
+      if (action === "--session-claim") {
+        const event = old?.queue?.find((item) => item.eventId === id);
+        if (!event) throw new WatchError(`대기 중인 이벤트가 없습니다: ${id}`);
+        const checked = reviewEvent(event, loadConfig(paths.config).host);
+        if (!checked.reviewRequested) throw new WatchError(checked.reason);
+        return claimSession(old, id);
+      }
+      return action === "--session-archived" ? markSessionArchived(old, id)
+        : bindSession(old, id, { threadId: optional("--thread-id"), clientThreadId: optional("--client-thread-id"), hostId: optional("--host-id"), worktreePath: optional("--worktree-path") });
+    });
     const session = sessionForEvent(state, id);
     return emit({ ...session, requestEventId: id, reused: session.eventId !== id });
   }
@@ -416,7 +464,7 @@ async function main(argv) {
       if (before && !watchActive(before)) { emit({ type: "watch_stopped", queued: before.queue?.length ?? 0 }); return; }
       try {
         const { state, picked, pending } = tick(paths, client);
-        const host = (state.queue ?? []).some((item) => MAYBE_ACTIONS.has(item.action)) ? loadConfig(paths.config).host : null;
+        const host = (state.queue ?? []).length > 0 ? loadConfig(paths.config).host : null;
         for (const item of state.queue ?? []) emit({ ...reviewEvent(item, host), mode: effectiveMode(readBypassState()) });
         process.stderr.write(`[${new Date().toISOString()}] pending=${pending} 신규=${picked}\n`);
       } catch (error) {

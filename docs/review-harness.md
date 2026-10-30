@@ -168,15 +168,16 @@ Claude 세션은 워크트리가 새로 만들어지면 `EnterWorktree`로 들�
 
 | 판정 | `action_name` |
 |---|---|
-| 확정 — 판단 없이 리뷰 | `review_requested`, `approval_required` |
+| 리뷰 요청 액션 — 최신 로그인 계정/리뷰어 일치 확인 후 허용 | `review_requested`, `approval_required` |
 | 실제 MR 작성자의 명시적 요청 댓글 조회·검증 후만 허용 | `directly_addressed`, `mentioned` |
 | 제외 | `assigned` 및 그 외 |
 
+- 모든 자동 요청은 같은 호스트의 `user`와 최신 MR `reviewers`를 조회하여 ID·username이 모두 일치하는 현재 리뷰어인지 확인합니다. 감지뿐 아니라 큐 재전달·`--session-claim`·`prepare --event-id`(inspect 포함)에서 재검증합니다. 리뷰어 변경/해제는 제외하고, API 실패·필드 누락은 오류로 남겨 큐·세션·리뷰 상태를 보존합니다. 이미 검토한 자동 회차의 `post`·`auto-approve`도 재확인합니다. 수동 MR 리뷰는 별도입니다.
 - `watch.json` 에 없는 프로젝트의 todo는 무시합니다
 - 첫 실행 시각을 `since` 로 저장하고 그 이전 todo는 재생하지 않습니다
 - 처리한 todo id는 pending에 남은 동안 기억하고 GitLab에서 사라진 것만 정리합니다. 감지 이벤트는 queue에 먼저 저장하고 ack 전까지 재전달합니다. GitLab todo를 done 처리하지 않습니다
 - 같은 폴링 배치 안에서 한 MR에 여러 todo가 오면 하나로 합치고, 확정 액션을 남깁니다. 배치를 넘어선 중복은 합치지 않습니다 — 수정 후 재리뷰 요청은 별개 사건입니다
-- 멘션은 MR 제목/todo.body가 아닌 `#note_ID`의 실제 댓글·작성자·system=false·MR opened를 조회합니다. 명시적인 한/영 리뷰 요청만 자동 처리하고 결과 보고·질문·감사·인용·부정·다른 리뷰어 댓글은 제외합니다. 미지원/애매한 표현은 수동 요청이 필요합니다. 큐 재전달도 실제 댓글을 재검사해 비요청은 `review_ignored`, `reviewRequested=false`로 출력합니다. 조회 오류를 요청/제외로 확정하지 않으며 큐를 지우지 않습니다. 기존 백로그의 제외 ack는 사용자 선택 범위를 따릅니다.
+- 댓글 요청은 로그인 계정에 대한 정확한 멘션도 필요합니다. 코드·인용 속 멘션이나 다른 사람만 태그한 요청은 제외합니다. 멘션은 MR 제목/todo.body가 아닌 `#note_ID`의 실제 댓글·작성자·system=false·MR opened를 조회합니다. 명시적인 한/영 리뷰 요청만 자동 처리하고 결과 보고·질문·감사·인용·부정·다른 리뷰어 댓글은 제외합니다. 미지원/애매한 표현은 수동 요청이 필요합니다. 큐 재전달도 실제 댓글을 재검사해 비요청은 `review_ignored`, `reviewRequested=false`로 출력합니다. 조회 오류를 요청/제외로 확정하지 않으며 큐를 지우지 않습니다. 기존 백로그의 제외 ack는 사용자 선택 범위를 따릅니다.
 - MR에 답글을 달면 GitLab이 그 MR의 내 todo를 자동으로 done 으로 넘깁니다. 게시한 MR이 밀린 목록에서 사라지는 건 이 때문입니다
 - `host` 가 설정에 없으면 `glab auth status` 에서 `Logged in to <호스트>` 가 정확히 하나일 때만 그것을 씁니다. `glab auth status` 는 다른 호스트가 401이어도 종료 코드 0이고 출력이 전부 stderr 라서, 종료 코드가 아니라 출력 문자열로 판정합니다
 

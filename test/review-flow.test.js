@@ -43,7 +43,7 @@ test("격리된 MR CLI 흐름: inspect → 관리 워크트리 → record → �
     git(author, "commit", "-am", "change"); git(author, "push", "origin", "feat/review");
     const head = git(author, "rev-parse", "HEAD");
     const remoteMr = { source_branch: "feat/review", target_branch: "main", state: "opened", author: { username: "author", name: "작성자" },
-      title: "test", Discussions: [], sha: head, diff_refs: { head_sha: head }, has_conflicts: false,
+      title: "test", reviewers: [{ id: 7, username: "self" }], Discussions: [], sha: head, diff_refs: { head_sha: head }, has_conflicts: false,
       detailed_merge_status: "mergeable", head_pipeline: { sha: head, status: "success" } };
     writeFileSync(mrFile, JSON.stringify(remoteMr));
     git(dir, "clone", origin.replaceAll("\\", "/"), clone);
@@ -59,6 +59,7 @@ cp.execFileSync = (file, args, options) => {
   if (args[1] === 'view') return fs.readFileSync(process.env.MMP_TEST_MR, 'utf8');
   if (args[1] === 'note') { fs.appendFileSync(process.env.MMP_TEST_NOTES, JSON.stringify({ args, host: options.env.GITLAB_HOST }) + '\\n'); return 'posted'; }
   if (args[0] === 'api') {
+    if (args[1] === 'user') return JSON.stringify({ id: 7, username: 'self' });
     const approved = fs.existsSync(process.env.MMP_TEST_APPROVAL);
     if (args[1].includes('/pipelines?')) return JSON.stringify(JSON.parse(fs.readFileSync(process.env.MMP_TEST_MR, 'utf8')).pipelines);
     if (args[1].endsWith('/approvals')) return JSON.stringify({ user_has_approved: approved, user_can_approve: true });
@@ -93,6 +94,14 @@ require('node:module').syncBuiltinESMExports();
     const mr = "https://gitlab.example.com/group/repo/-/merge_requests/7";
     assert.equal(run("prepare", mr, "--inspect", "--cwd", clone).sourceBranch, "feat/review");
     assert.equal(existsSync(join(clone, ".claude")), false);
+    writeFileSync(mrFile, JSON.stringify({ ...remoteMr, reviewers: [{ id: 8, username: "other" }] }));
+    assert.throws(() => run("prepare", mr, "--inspect", "--event-id", "42", "--cwd", clone), /리뷰어/);
+    assert.throws(() => run("prepare", mr, "--here", "--keep-branch", "--event-id", "42", "--cwd", managed), /리뷰어/);
+    assert.equal(run("status", "--cwd", managed).step, null);
+    assert.equal(git(managed, "rev-parse", "HEAD"), originalHead, "수신자 검증 전 fetch/HEAD 변경을 하지 않는다");
+    writeFileSync(mrFile, JSON.stringify({ ...remoteMr, reviewers: null }));
+    assert.throws(() => run("prepare", mr, "--inspect", "--event-id", "42", "--cwd", clone), /확인/);
+    writeFileSync(mrFile, JSON.stringify(remoteMr));
     const state = run("prepare", mr, "--here", "--keep-branch", "--event-id", "42", "--cwd", managed);
     assert.equal(state.eventId, "42");
     assert.equal(git(managed, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD");
@@ -104,6 +113,11 @@ require('node:module').syncBuiltinESMExports();
     assert.throws(() => run("post", "--cwd", managed), /사용자 승인/);
     assert.equal(existsSync(notesFile), false);
     assert.throws(() => run("notify", "--channel", "test", "--jira", "TEST-7", "--cwd", managed), /먼저 게시/);
+    writeFileSync(mrFile, JSON.stringify({ ...remoteMr, reviewers: [] }));
+    assert.throws(() => run("post", "--confirmed", "--cwd", managed), /리뷰어/);
+    assert.equal(existsSync(notesFile), false, "검토 도중 리뷰어가 바뀌어도 외부 게시하지 않는다");
+    assert.equal(run("status", "--cwd", managed).step, "reviewed");
+    writeFileSync(mrFile, JSON.stringify(remoteMr));
     assert.equal(run("post", "--confirmed", "--cwd", managed).step, "posted");
     const note = JSON.parse(readFileSync(notesFile, "utf8").trim());
     assert.equal(note.host, "gitlab.example.com");

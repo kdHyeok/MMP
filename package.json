@@ -1,6 +1,6 @@
 {
   "name": "mmp",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "private": true,
   "type": "module",
   "description": "Local Mattermost webhook, channel, and message convention MCP server",
