@@ -40,7 +40,7 @@ test("MCP와 승인 정책은 전달된 사용자 프로필과 명시적 데이�
 
 test("감시 대기 목록은 재조회에 보존되고 ack 후 같은 todo를 재전달하지 않는다", () => {
   const projects = { "g/r": { workdir: root, jiraBaseUrl: "https://jira.example.com" } };
-  const todo = { id: 1, target_type: "MergeRequest", action_name: "review_requested", project: { path_with_namespace: "g/r" },
+  const todo = { reviewTargetVerified: true, id: 1, target_type: "MergeRequest", action_name: "review_requested", project: { path_with_namespace: "g/r" },
     target: { iid: 7 }, target_url: "https://gitlab.example.com/g/r/-/merge_requests/7", created_at: "2026-10-07T00:00:00Z" };
   let state = enqueueTodos({ since: 1, seen: [] }, [todo], projects);
   assert.equal(state.queue.length, 1);
@@ -64,10 +64,11 @@ test("실제 감시 tick은 전달 전에 큐를 저장하고 재실행과 클�
     writeFileSync(paths.config, JSON.stringify({ host: "gitlab.example.com", projects: { "g/r": { workdir: root, jiraBaseUrl: "https://jira.example.com" } } }));
     writeFileSync(paths.state, JSON.stringify({ since: 1, seen: [], client: "codex" }));
     const fetch = () => [{ id: 9, target_type: "MergeRequest", action_name: "review_requested", project: { path_with_namespace: "g/r" }, target: { iid: 7 }, target_url: "https://gitlab.example.com/g/r/-/merge_requests/7", created_at: "2026-10-07T00:00:00Z" }];
-    const first = tick(paths, "codex", fetch);
+    const resolveRequest = (todo) => ({ ...todo, reviewTargetVerified: true });
+    const first = tick(paths, "codex", fetch, resolveRequest);
     assert.deepEqual(json(readFileSync(paths.state, "utf8")).queue, first.state.queue);
-    assert.equal(tick(paths, "codex", fetch).picked, 0);
-    assert.equal(tick(paths, "codex", fetch).state.queue.length, 1);
+    assert.equal(tick(paths, "codex", fetch, resolveRequest).picked, 0);
+    assert.equal(tick(paths, "codex", fetch, resolveRequest).state.queue.length, 1);
     const persisted = readFileSync(paths.state, "utf8");
     assert.throws(() => tick(paths, "codex", () => [{ ...fetch()[0], id: 10, action_name: "mentioned" }],
       () => { throw Error("comment API denied"); }), /comment API denied/);
@@ -143,10 +144,40 @@ test("세션 CLI는 생성 중 식별자를 보존하고 ack·감시 중지 후�
   const dir = mkdtempSync(join(tmpdir(), "mmp-sessions-"));
   const env = { MATTERMOST_MCP_DATA_DIR: dir };
   const stateFile = join(dir, "watch-state.json");
-  const run = (...args) => json(cli("mr-watch.mjs", args, env));
+  const targetFile = join(dir, "target.json");
+  const preload = join(dir, "glab-stub.cjs");
+  const user = { id: 7, username: "self" };
+  const target = { state: "opened", author: { username: "author" }, reviewers: [user] };
+  const setTarget = (mr) => writeFileSync(targetFile, JSON.stringify(mr));
+  const run = (...args) => json(execFileSync(process.execPath, ["--require", preload, join(root, "bin", "mr-watch.mjs"), ...args],
+    { encoding: "utf8", env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] }));
   try {
+    writeFileSync(join(dir, "watch.json"), JSON.stringify({ host: "gitlab.example.com", projects: { "g/r": { workdir: root, jiraBaseUrl: "https://jira.example.com" } } }));
+    writeFileSync(preload, `const cp = require('node:child_process'), fs = require('node:fs');
+const exec = cp.execFileSync;
+cp.execFileSync = (file, args, options) => {
+  if (file !== 'glab') return exec(file, args, options);
+  if (args[0] !== 'api') throw new Error('Unexpected glab call');
+  if (args[1] === 'user') return JSON.stringify({ id: 7, username: 'self' });
+  if (args[1].endsWith('/notes/9')) return JSON.stringify({ id: 9, system: false, author: { username: 'author' }, body: '@self 재리뷰 부탁드립니다' });
+  return fs.readFileSync(${JSON.stringify(targetFile)}, 'utf8');
+};
+require('node:module').syncBuiltinESMExports();`);
+    setTarget(target);
     writeFileSync(stateFile, JSON.stringify({ since: 1, seen: [42], stopped: true, queue: [{ eventId: "42", todoIds: [42],
-      project: "g/r", mrUrl: "https://gitlab.example.com/g/r/-/merge_requests/7" }] }));
+      action: "review_requested", project: "g/r", mrUrl: "https://gitlab.example.com/g/r/-/merge_requests/7" }] }));
+    const originalState = readFileSync(stateFile, "utf8");
+    setTarget({ ...target, reviewers: [{ id: 8, username: "other" }] });
+    assert.equal(run("--queue").reviewRequested, false);
+    assert.equal(run("--queue").type, "review_ignored");
+    assert.throws(() => run("--session-claim", "42"), /로그인 계정 대상/);
+    assert.equal(readFileSync(stateFile, "utf8"), originalState, "제외는 기존 큐·세션을 지우지 않는다");
+    setTarget({ state: "opened" });
+    assert.throws(() => run("--queue"), /확인/);
+    assert.throws(() => run("--session-claim", "42"), /확인/);
+    assert.equal(readFileSync(stateFile, "utf8"), originalState, "조회 실패도 큐를 보존한다");
+    setTarget(target);
+    assert.equal(run("--queue").reviewRequested, true);
     assert.equal(run("--session-claim", "42").threadId, null);
     assert.throws(() => run("--session-claim", "42"), /이미 생성/);
     assert.equal(run("--session-bind", "42", "--client-thread-id", "creating").clientThreadId, "creating");
@@ -155,7 +186,7 @@ test("세션 CLI는 생성 중 식별자를 보존하고 ack·감시 중지 후�
     assert.equal(run("--sessions").threadId, "ready");
     assert.equal(run("--status").active, false);
     const state = json(readFileSync(stateFile, "utf8"));
-    state.queue = [{ eventId: "43", todoIds: [43], project: "g/r", mrUrl: "https://gitlab.example.com/g/r/-/merge_requests/7#note_9" }];
+    state.queue = [{ eventId: "43", todoIds: [43], action: "mentioned", project: "g/r", mrUrl: "https://gitlab.example.com/g/r/-/merge_requests/7#note_9" }];
     writeFileSync(stateFile, JSON.stringify(state));
     const reused = run("--session-claim", "43");
     assert.equal(reused.reused, true);

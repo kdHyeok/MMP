@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAYBE_ACTIONS, REVIEW_ACTIONS, isExplicitReviewRequest, loadConfig, loggedInHosts, reviewEvent, selectTodos, verifyCommentRequest } from "../bin/mr-watch.mjs";
+import { MAYBE_ACTIONS, REVIEW_ACTIONS, isExplicitReviewRequest, loadConfig, loggedInHosts, reviewEvent, reviewTargetProblem, fetchReviewRequest, selectTodos, verifyCommentRequest } from "../bin/mr-watch.mjs";
 
 const PROJECTS = { "g/repo": { workdir: "C:/work/repo", jiraBaseUrl: "https://jira.example.com/browse" } };
 
@@ -18,13 +18,16 @@ function todo(overrides = {}) {
     project: { path_with_namespace: "g/repo" },
     created_at: "2026-09-22T10:00:00.000Z",
     body: "본문",
+    reviewTargetVerified: true,
+    reviewerUsername: "reviewer",
     ...overrides,
   };
 }
 
 const pick = (todos, options = {}) => selectTodos(todos, { projects: PROJECTS, seen: new Set(), since: 0, ...options });
 
-test("리뷰어 지정은 판정 없이 확정으로 흘린다", () => {
+test("리뷰어 지정도 최신 수신자가 검증된 요청만 흘린다", () => {
+  assert.deepEqual(pick([todo({ reviewTargetVerified: false })]), []);
   const [one] = pick([todo()]);
   assert.equal(one.certain, true);
   assert.equal(one.iid, 185);
@@ -58,16 +61,16 @@ test("일반 질문·리뷰 완료·감사·부정·인용은 자동 리뷰 요�
 
 test("실제 댓글 ID·MR 작성자·시스템 여부·열린 MR까지 대조하며 legacy 큐도 재검사한다", () => {
   const raw = todo({ action_name: "mentioned", target_url: "https://gitlab.example.com/g/repo/-/merge_requests/185#note_9" });
-  const note = { id: 9, system: false, body: "수정했습니다. 재리뷰 요청드립니다", author: { username: "author" } };
-  const mr = { state: "opened", author: { username: "author" } };
-  const verified = verifyCommentRequest(raw, note, mr);
+  const note = { id: 9, system: false, body: "@reviewer 수정했습니다. 재리뷰 요청드립니다", author: { username: "author" } };
+  const mr = { state: "opened", author: { username: "author" }, reviewers: [SELF] };
+  const verified = verifyCommentRequest(raw, note, mr, SELF);
   assert.equal(pick([verified])[0].requestNoteId, "9");
-  assert.equal(pick([raw], { resolveComment: (todo) => verifyCommentRequest(todo, note, mr) })[0].body, note.body);
+  assert.equal(pick([raw], { resolveRequest: (todo) => verifyCommentRequest(todo, note, mr, SELF) })[0].body, note.body);
   for (const changed of [{ ...note, id: 8 }, { ...note, system: true }, { ...note, author: { username: "reviewer" } },
-    { ...note, body: "리뷰 완료했습니다. 병합하세요." }, { ...note, body: "확인 부탁드립니다" }]) assert.equal(verifyCommentRequest(raw, changed, mr), null);
-  assert.equal(verifyCommentRequest(raw, note, { ...mr, state: "merged" }), null);
-  assert.equal(verifyCommentRequest(raw, note, { state: "opened" }), null);
-  assert.equal(verifyCommentRequest({ ...raw, target_url: raw.target_url.split("#")[0] }, note, mr), null);
+    { ...note, body: "리뷰 완료했습니다. 병합하세요." }, { ...note, body: "확인 부탁드립니다" }]) assert.equal(verifyCommentRequest(raw, changed, mr, SELF), null);
+  assert.equal(verifyCommentRequest(raw, note, { ...mr, state: "merged" }, SELF), null);
+  assert.equal(verifyCommentRequest(raw, note, { state: "opened", reviewers: [SELF] }, SELF), null);
+  assert.equal(verifyCommentRequest({ ...raw, target_url: raw.target_url.split("#")[0] }, note, mr, SELF), null);
   const event = { action: "mentioned", eventId: "old", mrUrl: raw.target_url, project: "g/repo", body: "리뷰 부탁드립니다" };
   assert.equal(reviewEvent(event, "gitlab.example.com", () => null).type, "review_ignored");
   assert.equal(reviewEvent(event, "gitlab.example.com", () => verified).reviewRequested, true);
@@ -162,4 +165,43 @@ test("설정에 host가 없으면 로그인한 호스트 하나를 쓰고, 애�
   write({});
   assert.throws(() => loadConfig(path, () => []), /로그인/);
   assert.throws(() => loadConfig(path, () => ["a.example.com", "b.example.com"]), /여러 호스트/);
+});
+
+const SELF = { id: 7, username: "reviewer" };
+const CURRENT_MR = { state: "opened", reviewers: [SELF], author: { username: "author" } };
+
+test("현재 로그인 계정의 ID와 사용자명이 최신 리뷰어와 모두 일치해야 한다", () => {
+  assert.equal(reviewTargetProblem(CURRENT_MR, SELF), null);
+  assert.equal(reviewTargetProblem({ ...CURRENT_MR, reviewers: [{ id: 8, username: "other" }, SELF] }, SELF), null);
+  for (const reviewers of [[], [{ id: 8, username: "other" }], [{ id: 8, username: "reviewer" }]])
+    assert.match(reviewTargetProblem({ ...CURRENT_MR, reviewers }, SELF), /리뷰어/);
+  assert.match(reviewTargetProblem({ ...CURRENT_MR, state: "merged" }, SELF), /열린/);
+  for (const mr of [{ state: "opened" }, { ...CURRENT_MR, reviewers: null }, { ...CURRENT_MR, reviewers: [{}] }])
+    assert.throws(() => reviewTargetProblem(mr, SELF), /확인/);
+  for (const user of [null, {}, { username: "reviewer" }])
+    assert.throws(() => reviewTargetProblem(CURRENT_MR, user), /로그인/);
+});
+
+test("옛 확정 요청도 최신 리뷰어가 바뀌면 큐 재전달에서 제외한다", () => {
+  const event = { action: "review_requested", eventId: "old", project: "g/repo", mrUrl: todo().target_url };
+  let mr = CURRENT_MR;
+  const get = (path) => path === "user" ? SELF : mr;
+  const fetch = (raw, host) => fetchReviewRequest(raw, host, get);
+  assert.equal(reviewEvent(event, "gitlab.example.com", fetch).reviewRequested, true);
+  mr = { ...CURRENT_MR, reviewers: [{ id: 8, username: "other" }] };
+  const ignored = reviewEvent({ ...event, reviewRequested: true, reviewTargetVerified: true }, "gitlab.example.com", fetch);
+  assert.equal(ignored.type, "review_ignored");
+  assert.equal(ignored.reviewRequested, false);
+  assert.equal(ignored.reviewTargetVerified, false);
+  assert.equal(pick([todo()], { resolveRequest: (raw) => fetch(raw, "gitlab.example.com") }).length, 0);
+  assert.throws(() => reviewEvent(event, "gitlab.example.com", () => { throw Error("API denied"); }), /API denied/);
+});
+
+test("댓글 요청은 최신 리뷰어와 실제 본인 멘션을 함께 검사한다", () => {
+  const raw = todo({ action_name: "mentioned", target_url: todo().target_url + "#note_9" });
+  const note = { id: 9, system: false, author: { username: "author" }, body: "@reviewer 재리뷰 부탁드립니다" };
+  assert.equal(verifyCommentRequest(raw, note, CURRENT_MR, SELF).reviewRequestVerified, true);
+  for (const body of ["@other 리뷰 부탁드립니다", "@reviewer-extra 리뷰 부탁드립니다", "`@reviewer` 리뷰 부탁드립니다", "> @reviewer\n@other 리뷰 부탁드립니다"])
+    assert.equal(verifyCommentRequest(raw, { ...note, body }, CURRENT_MR, SELF), null, body);
+  assert.equal(verifyCommentRequest(raw, note, { ...CURRENT_MR, reviewers: [] }, SELF), null);
 });

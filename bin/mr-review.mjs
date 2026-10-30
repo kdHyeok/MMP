@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { defaultChannel, effectiveMode, readState as readAutoState } from "./bypass-review.mjs";
-import { acquireWatchLock } from "./mr-watch.mjs";
+import { acquireWatchLock, reviewTargetProblem } from "./mr-watch.mjs";
 
 // bypass 동안은 사용자 승인 단계를 건너뛴다. 그 외 모드에서는 평소대로 승인을 요구한다.
 const autoMode = () => effectiveMode(readAutoState());
@@ -398,6 +398,13 @@ function requesterFlag(flags) {
   return flags.requester;
 }
 
+function assertAutomaticReviewTarget(state, mr) {
+  if (!state.eventId) return;
+  const latest = mr ?? glabApi(`projects/${encodeURIComponent(state.project)}/merge_requests/${state.iid}`, state.host);
+  const problem = reviewTargetProblem(latest, glabApi("user", state.host));
+  if (problem) fail(problem);
+}
+
 async function cmdPrepare(rawUrl, flags = {}) {
   const requester = requesterFlag(flags);
   if (!rawUrl) fail("사용법: mr-review.mjs prepare <MR 링크> [--worktree-root <경로>] [--here]");
@@ -421,6 +428,7 @@ async function cmdPrepare(rawUrl, flags = {}) {
 
   // --comments 응답은 일반 응답의 상위집합(Discussions가 추가될 뿐)이라 한 번만 부른다.
   const mr = glabJson(["mr", "view", String(iid), "--repo", project, "--comments"], host);
+  assertAutomaticReviewTarget({ host, project, iid, eventId: flags["event-id"] });
   const authorGitlab = mr.author?.username ?? null;
   // author.name 은 GitLab에 등록된 표시 이름(한글 실명)이다. 세션 제목과 보고에 쓴다.
   const authorName = mr.author?.name ?? authorGitlab;
@@ -587,6 +595,7 @@ function cmdAutoApprove() {
   if (!state) fail("먼저 prepare를 실행하세요.");
   const endpoint = `projects/${encodeURIComponent(state.project)}/merge_requests/${state.iid}`;
   const mr = glabApi(endpoint, state.host);
+  assertAutomaticReviewTarget(state, mr);
   const pipelines = mr.head_pipeline === null ? glabApi(`${endpoint}/pipelines?per_page=1`, state.host) : undefined;
   const problems = autoApproveProblems(state, autoMode(), mr, pipelines);
   if (problems.length) fail(`자동 Approve 제외:\n${problems.join("\n")}`);
@@ -615,6 +624,8 @@ function cmdPost(flags = {}) {
     fail("게시 전 사용자 승인이 필요합니다.\n1) 답글 전문을 대화에 보여주고\n2) 사용자에게 게시 여부를 묻고\n3) 승인받은 뒤 `post --confirmed`로 실행하세요.\n"
       + "(전체 무승인으로 돌리려면 `/mmp:bypass-review on`)");
   }
+
+  assertAutomaticReviewTarget(state);
 
   // --unique: 같은 본문이 이미 있으면 다시 달지 않는다(재실행 안전).
   const args = ["mr", "note", "create", String(state.iid), "--repo", state.project, "--message", state.body, "--unique"];
