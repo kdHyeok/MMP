@@ -199,6 +199,31 @@ function readState(cwd = process.cwd()) {
   }
 }
 
+// Host-level execution denials happen before this process starts; diagnostics must never retry or mutate state.
+export function diagnoseReview(state, mode = "on") {
+  const pending = { prepared: ["record"], reviewed: ["post"], posted: ["notify"], notified: [] };
+  return {
+    step: state?.step ?? null,
+    mrUrl: state?.mrUrl ?? null,
+    reviewedSha: state?.reviewedSha ?? null,
+    nextActions: state?.step === "posted" && state.verdict === "approve" && !state.approval
+      ? ["auto-approve (조건 충족 시)", "notify"] : pending[state?.step] ?? [],
+    completed: { postedAt: state?.postedAt ?? null, notifiedAt: state?.notifiedAt ?? null, approval: state?.approval ?? null },
+    notificationRequester: state?.notificationRequester ?? null,
+    mmpApproval: { bypass: mode === "bypass", confirmedScope: "MMP 게시·수신 정책 확인만 적용" },
+    hostApproval: {
+      status: "not_observable",
+      explanation: "Codex의 실행 전 거부는 MMP 프로세스에 전달되지 않습니다. 채팅 승인·--confirmed·bypass는 호스트 승인이나 거부 해제를 증명하지 않습니다.",
+      recovery: [
+        "명시적 거부 사유를 그대로 보고하고 일반 채팅 승인을 반복 요청하거나 같은 전송을 우회하지 마세요.",
+        "지원되는 Codex TUI의 /approve에서 사용자가 거부된 정확한 명령을 선택하면 1회 재시도 승인을 요청할 수 있습니다. 재시도도 호스트 검토를 받습니다.",
+        "데스크톱 앱의 동일 기능 제공 여부는 별도 확인해야 합니다. 호스트의 해당 작업 재시도 승인이 확인되기 전에는 게시·DM·ack를 진행하지 마세요.",
+        "호스트 승인 후 status로 완료 단계를 확인하고 미완료 단계만 재개하세요. prepare/reset으로 기존 기록을 덮지 마세요.",
+      ],
+    },
+  };
+}
+
 function writeState(state, cwd = process.cwd()) {
   const path = statePath(cwd);
   const temp = `${path}.${process.pid}.tmp`;
@@ -815,6 +840,7 @@ async function main(argv) {
     case "auto-approve": return cmdAutoApprove();
     case "notify": return cmdNotify(parseFlags(rest));
     case "status": return readState() ?? { step: null };
+    case "diagnose": return diagnoseReview(readState(), autoMode());
     case "reset": {
       const path = statePath();
       if (existsSync(path)) rmSync(path);
@@ -822,7 +848,7 @@ async function main(argv) {
     }
     case "gate": return cmdGate();
     default:
-      return fail(`알 수 없는 명령: ${command ?? "(없음)"}\n사용: prepare | record | post | auto-approve | notify | status | reset | gate\n단계: ${STEPS.join(" → ")}`);
+      return fail(`알 수 없는 명령: ${command ?? "(없음)"}\n사용: prepare | record | post | auto-approve | notify | status | diagnose | reset | gate\n단계: ${STEPS.join(" → ")}`);
   }
 }
 

@@ -17,9 +17,40 @@ const json = (text) => JSON.parse(text);
 
 test("Codex 재리뷰 예제는 요청자 DM이 기본이며 self-only를 강제하지 않는다", () => {
   const guide = readFileSync(join(root, "skills", "references", "codex.md"), "utf8");
-  assert.ok(guide.includes("--requester <확인한GitLabID>"));
+  assert.ok(guide.includes("--requester <확인한GitLab사용자명>"));
   assert.ok(guide.includes("최신 사용자 지시"));
   assert.ok(!guide.includes("--event-id <새eventId> --self-only"));
+});
+
+test("Codex 실행 거부 진단은 상태를 보존하고 전송·확인 우회를 하지 않는다", () => {
+  const dir = mkdtempSync(join(tmpdir(), "mmp-diagnose-"));
+  const env = { MATTERMOST_MCP_DATA_DIR: join(dir, "data") };
+  try {
+    execFileSync("git", ["init", "-b", "main", dir], { stdio: "pipe" });
+    const stateFile = join(dir, ".git", "mmp-mr-review.json");
+    const state = { step: "reviewed", mrUrl: "https://gitlab.example.com/g/r/-/merge_requests/7",
+      verdict: "hold", reviewedSha: "a".repeat(40), notificationRequester: "requester", postedAt: null, notifiedAt: null };
+    const diagnose = () => json(cli("mr-review.mjs", ["diagnose", "--cwd", dir], env));
+    writeFileSync(stateFile, JSON.stringify(state));
+    const before = readFileSync(stateFile, "utf8");
+    const result = diagnose();
+    assert.equal(result.mrUrl, state.mrUrl);
+    assert.equal(result.reviewedSha, state.reviewedSha);
+    assert.deepEqual(result.nextActions, ["post"]);
+    assert.equal(result.mmpApproval.bypass, false);
+    assert.equal(result.hostApproval.status, "not_observable");
+    assert.equal(readFileSync(stateFile, "utf8"), before, "거부를 posted/confirmed로 기록하지 않는다");
+    assert.equal(existsSync(stateFile + ".lock"), false, "읽기 전용 진단은 잠금을 만들지 않는다");
+    assert.equal(existsSync(env.MATTERMOST_MCP_DATA_DIR), false, "공유 설정·DB를 생성하지 않는다");
+    for (const [patch, next] of [
+      [{ step: "posted", postedAt: "posted" }, ["notify"]],
+      [{ step: "posted", verdict: "approve", postedAt: "posted" }, ["auto-approve (조건 충족 시)", "notify"]],
+      [{ step: "notified", postedAt: "posted", notifiedAt: "sent" }, []],
+    ]) {
+      writeFileSync(stateFile, JSON.stringify({ ...state, ...patch }));
+      assert.deepEqual(diagnose().nextActions, next, "완료 단계는 재전송 대상으로 제안하지 않는다");
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("MCP와 승인 정책은 전달된 사용자 프로필과 명시적 데이터 경로를 공유한다", () => {
