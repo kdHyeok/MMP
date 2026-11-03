@@ -356,6 +356,16 @@ export function reviewEvent(item, host, fetch = fetchReviewRequest) {
       : { type: "review_ignored", reason: "현재 로그인 계정 대상의 유효한 MR 리뷰 요청이 아닙니다. 최신 리뷰어와 댓글 멘션을 확인하세요." }) };
 }
 
+// 상주 감시는 같은 이벤트를 판정이 바뀔 때만 다시 알린다. 재시작하면 ack 전 대기 목록을 한 번 다시 보낸다.
+export function changedEvents(events, emitted) {
+  return events.filter((event) => {
+    const key = `${event.reviewRequested}:${event.mode}`;
+    if (emitted.get(event.eventId) === key) return false;
+    emitted.set(event.eventId, key);
+    return true;
+  });
+}
+
 export function tick(paths, client, fetch = fetchTodos, resolveRequest = fetchReviewRequest) {
   const before = readWatchState(paths.state);
   if (before?.client && before.client !== client) throw new WatchError(`감시는 ${before.client}에서 시작했습니다. 먼저 중지하고 ${client}에서 다시 시작하세요.`);
@@ -459,13 +469,15 @@ async function main(argv) {
   const release = acquireWatchLock(paths.runLock);
   try {
     const once = argv.includes("--once");
+    const emitted = new Map();
     for (;;) {
       const before = readWatchState(paths.state);
       if (before && !watchActive(before)) { emit({ type: "watch_stopped", queued: before.queue?.length ?? 0 }); return; }
       try {
         const { state, picked, pending } = tick(paths, client);
         const host = (state.queue ?? []).length > 0 ? loadConfig(paths.config).host : null;
-        for (const item of state.queue ?? []) emit({ ...reviewEvent(item, host), mode: effectiveMode(readBypassState()) });
+        const events = (state.queue ?? []).map((item) => ({ ...reviewEvent(item, host), mode: effectiveMode(readBypassState()) }));
+        for (const event of changedEvents(events, emitted)) emit(event);
         process.stderr.write(`[${new Date().toISOString()}] pending=${pending} 신규=${picked}\n`);
       } catch (error) {
         if (!(error instanceof WatchError)) throw error;
