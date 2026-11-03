@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAYBE_ACTIONS, REVIEW_ACTIONS, isExplicitReviewRequest, loadConfig, loggedInHosts, reviewEvent, reviewTargetProblem, fetchReviewRequest, selectTodos, verifyCommentRequest } from "../bin/mr-watch.mjs";
+import { MAYBE_ACTIONS, REVIEW_ACTIONS, changedEvents, isExplicitReviewRequest, loadConfig, loggedInHosts, reviewEvent, reviewTargetProblem, fetchReviewRequest, selectTodos, verifyCommentRequest } from "../bin/mr-watch.mjs";
 
 const PROJECTS = { "g/repo": { workdir: "C:/work/repo", jiraBaseUrl: "https://jira.example.com/browse" } };
 
@@ -204,4 +204,18 @@ test("댓글 요청은 최신 리뷰어와 실제 본인 멘션을 함께 검사
   for (const body of ["@other 리뷰 부탁드립니다", "@reviewer-extra 리뷰 부탁드립니다", "`@reviewer` 리뷰 부탁드립니다", "> @reviewer\n@other 리뷰 부탁드립니다"])
     assert.equal(verifyCommentRequest(raw, { ...note, body }, CURRENT_MR, SELF), null, body);
   assert.equal(verifyCommentRequest(raw, note, { ...CURRENT_MR, reviewers: [] }, SELF), null);
+});
+
+test("상주 감시는 ack 전 대기 이벤트를 판정이 바뀔 때만 다시 알린다", () => {
+  const emitted = new Map();
+  const ignored = { eventId: "1", reviewRequested: false, mode: "approve" };
+  const requested = { eventId: "2", reviewRequested: true, mode: "approve" };
+  assert.deepEqual(changedEvents([ignored, requested], emitted), [ignored, requested]);
+  assert.deepEqual(changedEvents([ignored, requested], emitted), []);
+  const nowRequested = { ...ignored, reviewRequested: true };
+  assert.deepEqual(changedEvents([nowRequested, requested], emitted), [nowRequested]);
+  const bypass = { ...requested, mode: "bypass" };
+  assert.deepEqual(changedEvents([nowRequested, bypass], emitted), [bypass]);
+  // 재시작하면 새 기록으로 대기 목록 전체를 다시 받는다.
+  assert.deepEqual(changedEvents([nowRequested, bypass], new Map()), [nowRequested, bypass]);
 });
