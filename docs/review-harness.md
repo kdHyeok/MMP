@@ -2,6 +2,16 @@
 
 README의 "MR 리뷰 자동화"가 **무엇을 하는지**를 설명한다면, 이 문서는 **어떻게 강제하는지**를 설명합니다. 사용만 할 거라면 읽지 않아도 됩니다. 규칙을 바꾸거나 막힌 이유를 파고들 때 보세요.
 
+## Codex 호스트 차단과 MMP 확인
+
+`CreateProcess ... Rejected`는 하네스 실행 전에 발생할 수 있다. 이때 MMP의 게시 함수·GitLab API에 도달했다고 단정할 수 없다. `--confirmed`·bypass·훅 allow는 MMP 검사만 통과하며 Codex 호스트 승인을 대체하지 않는다. 동일 채팅에서 사용자가 직접 승인했는데도 거부됐다면 추가 채팅 확인으로 해결된다고 안내하지 않는다.
+
+[공식 문서](https://learn.chatgpt.com/docs/sandboxing/auto-review#denials-and-failure-behavior)는 지원되는 Codex TUI의 `/approve`에서 특정 거부 명령에 대한 1회 재시도 승인을 제공한다. 재시도도 검토를 받으며 모든 거부를 무조건 해제하지 않는다. 데스크톱 지원 여부와 내부 분류 이유는 이 플러그인이 확인할 수 없다. 사용자가 해당 호스트 절차를 완료하기 전에는 재전송하지 않는다.
+
+`mr-review.mjs diagnose --cwd "<worktreePath>"`는 상태를 보존한 채 미완료 단계와 승인 경계를 보여 준다. 호스트 거부 로그나 사용자 승인 여부를 추정 생성하지 않는다. Git 조회와 로컬 파일 읽기 권한은 필요하다. 실제 복구 절차는 [Codex 안내](../skills/references/codex.md#codex-실행-거부의-진단과-복구)를 따른다.
+
+`--requester`는 숫자 계정 ID가 아닌 GitLab username을 받는다. 기존 상태에 숫자 ID가 들어갔다면 API/이벤트로 정확한 username과 매핑을 먼저 확인하고, 실제 사용자가 허용한 수신자에 대해서만 기존 `notify --requester <username> --confirmed`로 정책을 바로잡는다. 저장 상태를 직접 편집하거나 완료 DM을 반복하지 않는다.
+
 ## 구성
 
 | 파일 | 역할 |
@@ -35,6 +45,7 @@ prepared → reviewed → posted → (조건부 auto-approve) → notified
 | `record <approve\|hold> <본문파일>` | 판정과 답글 본문 기록 | 필수 섹션·태그·인용, 판정 일관성(아래 "판정 검사")을 어기면 거부 |
 | `post` | `glab mr note create --unique` 로 답글 게시 | `reviewed` 가 아니면 거부, 이미 게시했으면 거부. `bypass` 가 아니면 `--confirmed` 없이 거부 |
 | `auto-approve` | GitLab 승인 API에 검토한 SHA를 전달 | 아래 모든 조건 만족 시만 허용. 이미 승인했으면 재검증하고 중복 POST하지 않음 |
+| `diagnose` | 저장된 완료 단계·재개 지점과 MMP/호스트 승인 경계를 읽기 전용 출력 | 외부 조회·전송·상태 변경 없음. 호스트 거부 원인은 관측 불가 |
 | `notify` | `review-complete` 컨벤션으로 MR 작성자에게 DM | `posted` 가 아니면 거부 |
 
 ### 필수 섹션
@@ -134,7 +145,7 @@ prepared → reviewed → posted → (조건부 auto-approve) → notified
 
 본인 DM 제한은 `prepare --self-only`로 리뷰 상태에 저장하고 `notify`가 등록된 `isSelf` 수신자 한 명만 선택합니다. 명시적 다른 수신자 옵션도 거부하며, 일반적인 작성자 DM 흐름은 그대로 유지합니다.
 
-리뷰 완료의 기본 수신 정책은 요청자 우선입니다. 검증된 GitLab 요청자의 ID를 `prepare --requester <ID>`로 지정하면 notificationRequester로 저장하고 notify가 정확한 매핑을 재조회합니다. 매핑 누락/중복은 본인·작성자로 대체하지 않으며 다른 participant-id/mention 지정도 거부합니다. 별도 요청자가 전혀 없는 기존 리뷰만 MR 작성자 기본 경로를 씁니다. 과거 self-only를 해제하라는 최신 사용자 지시를 확인한 경우에만 `prepare --requester <ID> --confirmed` 또는 posted 회차의 `notify --requester <ID> --confirmed`로 변경합니다. 완료된 notified DM은 재전송하지 않습니다.
+리뷰 완료의 기본 수신 정책은 요청자 우선입니다. 검증된 GitLab 요청자의 username(@ 제외)을 `prepare --requester <username>`으로 지정하면 notificationRequester로 저장하고 notify가 정확한 매핑을 재조회합니다. 매핑 누락/중복은 본인·작성자로 대체하지 않으며 다른 participant-id/mention 지정도 거부합니다. 별도 요청자가 전혀 없는 기존 리뷰만 MR 작성자 기본 경로를 씁니다. 과거 self-only를 해제하라는 최신 사용자 지시를 확인한 경우에만 `prepare --requester <username> --confirmed` 또는 posted 회차의 `notify --requester <username> --confirmed`로 변경합니다. 완료된 notified DM은 재전송하지 않습니다.
 
 ### Codex 독립 리뷰 채팅과 병합 후 보관
 
