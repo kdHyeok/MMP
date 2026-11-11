@@ -167,7 +167,7 @@ Codex는 `prepare --inspect`로 MR 정보를 읽고 관리 워크트리를 준�
 - 커밋되지 않은 변경이 있는 워크트리는 거부합니다
 - 포크 MR이라 원격에 소스 브랜치가 없으면 `merge-requests/<iid>/head` 로 폴백합니다
 
-Claude 데스크톱에서 MR별 세션 생성을 승인한 감시는 MR마다 `start_session`으로 리뷰 세션을 만들고, 그 세션은 `EnterWorktree` 없이 하네스 `--cwd`로 `mr-<iid>` 워크트리를 씁니다(자동 이벤트로 시작한 차례에서는 세션 카드로 제안). 세션 생성 도구가 없거나 승인하지 않은 Claude 세션은 워크트리가 새로 만들어지면 `EnterWorktree`로 들어가고 인라인 감시 리뷰가 끝나면 `ExitWorktree({action: "keep"})`으로 나옵니다. Codex는 관리 워크트리의 경로를 셸 workdir와 하네스 --cwd에 명시합니다. 셸 한 줄의 cd가 다음 호출에 유지된다고 가정하지 않습니다. 양쪽 모두 리뷰 종료 직후 워크트리를 자동 삭제하지 않습니다.
+Claude 데스크톱에서 MR별 세션 생성을 승인한 감시는 MR마다 `start_session`으로 리뷰 세션을 만들고, 그 세션은 `EnterWorktree` 없이 하네스 `--cwd`로 `mr-<iid>` 워크트리를 씁니다(자동 이벤트로 시작한 차례에서는 bypass가 켜져 있으면 백그라운드 서브에이전트로 리뷰하고, 꺼져 있으면 세션 카드로 제안). 세션 생성 도구가 없거나 승인하지 않은 Claude 세션은 워크트리가 새로 만들어지면 `EnterWorktree`로 들어가고 인라인 감시 리뷰가 끝나면 `ExitWorktree({action: "keep"})`으로 나옵니다. Codex는 관리 워크트리의 경로를 셸 workdir와 하네스 --cwd에 명시합니다. 셸 한 줄의 cd가 다음 호출에 유지된다고 가정하지 않습니다. 양쪽 모두 리뷰 종료 직후 워크트리를 자동 삭제하지 않습니다.
 
 ## 세션 제목
 
