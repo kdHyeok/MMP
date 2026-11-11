@@ -1,6 +1,6 @@
 {
   "name": "mmp",
-  "version": "0.8.7",
+  "version": "0.8.8",
   "description": "Manage Mattermost messages and GitLab MR review workflows from Codex.",
   "author": {
     "name": "kdHyeok",
