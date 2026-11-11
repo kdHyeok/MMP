@@ -33,7 +33,7 @@ prepare → (리뷰) → record → post → (조건 충족 시 auto-approve) �
 node "<PLUGIN_ROOT>/bin/mr-review.mjs" prepare "<MR 링크>"
 ```
 
-**`--here`는 리뷰 전용으로 준비된 연결 워크트리에서만 사용한다.** Claude의 작업 칩 또는 Codex 관리 워크트리처럼 호출자가 전용 자리임을 확인한 경우다. 다른 작업 중인 워크트리를 보고 임의로 붙이지 않는다. 감시 이벤트로 시작할 때는 `--event-id <eventId>`를 함께 전달한다.
+**`--here`는 리뷰 전용으로 준비된 연결 워크트리에서만 사용한다.** Claude 감시가 만든 리뷰 세션의 앱 워크트리, Codex 관리 워크트리, 같은 MR의 기존 리뷰 워크트리(재리뷰)처럼 호출자가 전용 자리임을 확인한 경우다. 다른 작업 중인 워크트리를 보고 임의로 붙이지 않는다. 감시 이벤트로 시작할 때는 `--event-id <eventId>`를 함께 전달한다.
 
 현재 클라이언트 실행 안내에 따라 제목을 기억·변경하고 리뷰 워크트리를 준비한다. 출력의 `worktreePath`를 이후 모든 코드 조회·테스트의 작업 경로로 사용한다. 하네스의 `record`/`post`/`notify`/`status`/`reset`에는 `--cwd "<worktreePath>"`를 붙인다. 이미 준비한 리뷰를 재전달 이벤트 때문에 다시 prepare하지 않는다.
 
